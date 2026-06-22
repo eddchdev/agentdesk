@@ -1,0 +1,15 @@
+{
+  "_comment_pt": "Adicione este bloco ao seu ~/.claude.json ou ~/.config/claude/claude_desktop_config.json dentro de mcpServers. Ajuste o caminho absoluto se necessário.",
+  "mcpServers": {
+    "agentdesk": {
+      "command": "node",
+      "args": ["/home/eddch/Projetos/MCP_AgentDesk/dist/index.js"]
+    }
+  },
+  "_alternativa_dev": {
+    "agentdesk": {
+      "command": "npx",
+      "args": ["tsx", "/home/eddch/Projetos/MCP_AgentDesk/src/index.ts"]
+    }
+  }
+}

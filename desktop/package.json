@@ -1,0 +1,45 @@
+{
+  "name": "agentdesk-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AgentDesk Desktop — app Electron read-only para monitorar a equipe de Claudes do AgentDesk MCP.",
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "ui:build": "vite build",
+    "ui:dev": "vite",
+    "electron:build": "tsc -p tsconfig.electron.json",
+    "build": "npm run electron:build && npm run ui:build",
+    "start": "npm run build && electron .",
+    "dev": "AGENTDESK_DEV=1 concurrently -k -s first -n VITE,ELEC \"vite\" \"wait-on http://localhost:5173 && npm run electron:build && electron .\"",
+    "rebuild": "npx --yes @electron/rebuild@latest -f -w better-sqlite3"
+  },
+  "dependencies": {
+    "@xterm/addon-canvas": "^0.7.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.5.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.0",
+    "electron": "^32.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.0",
+    "wait-on": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
+  }
+}

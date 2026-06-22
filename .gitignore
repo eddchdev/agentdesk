@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-electron/
+dist-ui/
+*.log
+.DS_Store
+.env
+.env.local
+*.db
+*.sqlite
+*.sqlite3
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
