@@ -424,6 +424,32 @@ await test("painel: filtro por projeto alcança equipes project:*", async () => 
   assert(r.includes("EQUIPE: project:legado-x"), `filtro por projeto não resolveu:\n${r.split("\n")[0]}`);
 });
 
+// ─── ressurreição avisada ────────────────────────────────────────────────────
+
+await test("vida: ressurreição avisa quais travas se perderam e restaura a task", async () => {
+  const pasta = join(TMP, "equipe-aviso");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-aviso", pasta });
+  const sess = um.match(/\(id=([\w-]+)\)/)?.[1];
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+  await call("travar_arquivos", { session_id: sess, arquivos: [join(pasta, "critico.ts")] });
+
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess);
+  await call("listar_status", { pasta });
+  const morto = rawDb().prepare("SELECT current_task_id FROM agents WHERE id = ?").get(agentId);
+  assert(morto.current_task_id === null, "setup: sweep deveria zerar o ponteiro da task");
+
+  await call("atualizar_progresso", { session_id: sess, progresso: "acordei" });
+  const vivo = rawDb().prepare("SELECT current_task_id, status FROM agents WHERE id = ?").get(agentId);
+  assert(vivo.status === "working", `agente não voltou a working: ${vivo.status}`);
+  assert(vivo.current_task_id, "ressurreição deveria restaurar o ponteiro da task em andamento");
+
+  const chat = await call("listar_chat", { pasta, limite: 10 });
+  assert(
+    /Travas liberadas nesse período/.test(chat) && chat.includes("critico.ts"),
+    `faltou o alerta de travas perdidas no chat:\n${chat}`
+  );
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { now } from "./db.js";
+import { postChat } from "./chat.js";
 
 // Thresholds calibrados para acomodar o intervalo OCIOSO de 300s do auto-tick.
 // Antes: SUSPECT=60s, DEAD=180s → agentes saudáveis em idle eram marcados DEAD
@@ -117,14 +118,46 @@ export function requireActiveSession(db: Database.Database, sessionId: string): 
   // Travas que o sweep liberou enquanto a sessão esteve "morta" NÃO voltam
   // sozinhas (outro agente pode tê-las tomado); o dono retrava se precisar.
   const ts = now();
+  const estavaMorta = row.status === "dead";
+  const semNoticiasDesde = row.last_heartbeat;
   db.prepare("UPDATE sessions SET last_heartbeat = ?, status = 'active' WHERE id = ?").run(ts, row.id);
   if (row.agent_id) {
+    // Restaura também o ponteiro da tarefa em andamento (o sweep o zera ao
+    // marcar dead; sem isso todo ciclo falso-morto deixava o agente sem task).
     db.prepare(
       `UPDATE agents SET last_heartbeat = ?, updated_at = ?,
          status = CASE WHEN status = 'dead' THEN 'working' ELSE status END,
-         current_session_id = COALESCE(current_session_id, ?)
+         current_session_id = COALESCE(current_session_id, ?),
+         current_task_id = COALESCE(
+           current_task_id,
+           (SELECT id FROM tasks WHERE session_id = ? AND status = 'in_progress' ORDER BY created_at DESC LIMIT 1)
+         )
        WHERE id = ? AND status != 'archived'`
-    ).run(ts, ts, row.id, row.agent_id);
+    ).run(ts, ts, row.id, row.id, row.agent_id);
+  }
+  // A ressurreição não devolve travas, mas também não pode ser silenciosa:
+  // avisa (uma vez por ciclo de morte) o que se soltou no período sem
+  // notícias, para o agente retravar antes de editar.
+  if (estavaMorta) {
+    const perdidas = db.prepare(
+      "SELECT DISTINCT file_path FROM locks WHERE session_id = ? AND released_at IS NOT NULL AND released_at >= ?"
+    ).all(row.id, semNoticiasDesde) as { file_path: string }[];
+    if (perdidas.length) {
+      const min = Math.max(1, Math.round((ts - semNoticiasDesde) / 60_000));
+      postChat(db, {
+        sessionId: row.id,
+        sessionName: row.name,
+        role: row.role,
+        type: "alerta",
+        to: row.agent_name ?? null,
+        message:
+          `Sessão ${row.name} voltou após ${min}min sem notícias. ` +
+          `Travas liberadas nesse período: ${perdidas.map((l) => l.file_path).join(", ")}. ` +
+          `RETRAVE com travar_arquivos antes de editar esses arquivos.`,
+        agentId: row.agent_id ?? null,
+        agentName: row.agent_name ?? null,
+      });
+    }
   }
   row.last_heartbeat = ts;
   row.status = "active";
