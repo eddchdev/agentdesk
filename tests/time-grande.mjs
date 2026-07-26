@@ -328,6 +328,25 @@ await test("abrir: entrada única traz inbox, equipe, fila, travas e chat numa r
   assert(/trava recusada/.test(w2), `deveria recusar a trava em conflito na entrada:\n${w2}`);
 });
 
+// ─── handoff com contexto ────────────────────────────────────────────────────
+
+await test("handoff: quem recebe vê o que foi decidido e tentado, não só a nota", async () => {
+  const pasta = join(TMP, "equipe-handoff");
+  const a = await call("abrir_sessao", { cargo: "executor", tarefa: "migrar canal", pasta });
+  const sessA = a.match(/\(id=([\w-]+)\)/)?.[1];
+  await call("atualizar_progresso", { session_id: sessA, progresso: "Tentei via API v1, falhou por auth" });
+  await call("atualizar_progresso", { session_id: sessA, progresso: "Decidi usar fila local, falta teste" });
+  await call("passar_tarefa", { session_id: sessA, destinatario: "revisor", nota: "continua daqui" });
+
+  const b = await call("abrir_sessao", { cargo: "revisor", tarefa: "assumir handoff", pasta });
+  const agB = b.match(/\[id=([\w-]+)\]/)?.[1];
+  const inbox = await call("inbox_agente", { agent: agB });
+  assert(inbox.includes("continua daqui"), `inbox sem a nota do handoff:\n${inbox}`);
+  assert(inbox.includes("migrar canal"), `handoff sem o título da tarefa:\n${inbox}`);
+  assert(inbox.includes("Tentei via API v1, falhou por auth"), `handoff sem o histórico de tentativas:\n${inbox}`);
+  assert(inbox.includes("Decidi usar fila local"), `handoff sem as decisões de quem passou:\n${inbox}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

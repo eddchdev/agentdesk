@@ -845,11 +845,36 @@ export const tools: ToolDef[] = [
 
       if (!taskId) throw new Error("Nenhuma tarefa em andamento para passar.");
 
+      // Handoff com contexto: quem recebe precisa saber o que já foi decidido
+      // e tentado, não só a nota. Sem isso o destinatário recebia o título e
+      // recomeçava do zero, repetindo caminhos que já falharam.
+      const tarefaPassada = db.prepare("SELECT title FROM tasks WHERE id = ?").get(taskId) as
+        | { title: string }
+        | undefined;
+      const historico = db.prepare(
+        `SELECT progress, created_at FROM updates
+         WHERE session_id = ? OR task_id = ?
+         ORDER BY created_at DESC LIMIT 5`
+      ).all(s.id, taskId) as Array<{ progress: string; created_at: number }>;
+      const notaCompleta = [
+        args.nota,
+        tarefaPassada ? `Tarefa: ${tarefaPassada.title}` : null,
+        ...(historico.length
+          ? [
+              "O que já foi feito/decidido (mais recente primeiro):",
+              ...historico.map((u) => {
+                const quando = new Date(u.created_at).toISOString().replace("T", " ").slice(0, 16);
+                return `  - [${quando}] ${u.progress}`;
+              }),
+            ]
+          : []),
+      ].filter(Boolean).join("\n");
+
       const ts = now();
       const hid = newId();
       db.prepare(
         "INSERT INTO handoffs (id, from_session, to_target, task_id, note, created_at, accepted, team_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
-      ).run(hid, s.id, args.destinatario, taskId, args.nota, ts, teamKeyForSession(s, ag));
+      ).run(hid, s.id, args.destinatario, taskId, notaCompleta, ts, teamKeyForSession(s, ag));
       notify({
         kind: "handoff",
         to: args.destinatario,
@@ -873,7 +898,7 @@ export const tools: ToolDef[] = [
         type: "passar",
         to: args.destinatario,
         taskId,
-        message: `Passando tarefa: ${args.nota}`,
+        message: `Passando tarefa${tarefaPassada ? ` "${tarefaPassada.title}"` : ""}: ${args.nota}`,
         agentId: ag?.id ?? null,
         agentName: ag?.name ?? null,
       });
