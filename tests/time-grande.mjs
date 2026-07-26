@@ -241,6 +241,30 @@ await test("painel: filtra pela equipe por padrão; todas_equipes mostra tudo", 
   );
 });
 
+// ─── fim do balde 'default' ──────────────────────────────────────────────────
+
+await test("equipes: sem pasta informada, herda a pasta do ambiente", async () => {
+  const pasta = join(TMP, "proj-env");
+  process.env.AGENTDESK_FOLDER = pasta;
+  try {
+    const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-env" });
+    const sessId = um.match(/\(id=([\w-]+)\)/)?.[1];
+    const row = rawDb().prepare("SELECT team_key FROM sessions WHERE id = ?").get(sessId);
+    assert(row.team_key === `folder:${pasta}`, `team_key deveria vir do ambiente, veio '${row.team_key}'`);
+  } finally {
+    delete process.env.AGENTDESK_FOLDER;
+  }
+
+  // Sem pasta e sem env: usa a pasta do processo, nunca o balde 'default'.
+  const dois = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-cwd" });
+  const sessId2 = dois.match(/\(id=([\w-]+)\)/)?.[1];
+  const row2 = rawDb().prepare("SELECT team_key FROM sessions WHERE id = ?").get(sessId2);
+  assert(
+    row2.team_key !== "default" && row2.team_key.startsWith("folder:"),
+    `sessão sem pasta caiu no balde errado: '${row2.team_key}'`
+  );
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

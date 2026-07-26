@@ -547,10 +547,14 @@ export const tools: ToolDef[] = [
       const db = getDb();
       sweepSessions(db);
 
+      // Sem pasta explícita, herda do ambiente. Sem isso, sessões de projetos
+      // diferentes caíam todas na equipe 'default' e o chat vinha misturado.
+      const pastaEfetiva = p.pasta || process.env.AGENTDESK_FOLDER || process.cwd();
+
       // Proteção contra duplicata: na operação real, o retry do cliente após
       // um falso-morto criava dois agentes com o mesmo cargo e a mesma tarefa
       // ("um morto e um trabalhando"). Sessão viva igual recusa; morta retoma.
-      const dedupTeamKey = deriveTeamKey(p.pasta, p.projeto);
+      const dedupTeamKey = deriveTeamKey(pastaEfetiva, p.projeto);
       if (!p.force_new) {
         const iguais = db.prepare(
           `SELECT * FROM sessions
@@ -609,7 +613,7 @@ export const tools: ToolDef[] = [
         name: agentName,
         role: p.cargo,
         project: p.projeto,
-        folder: p.pasta,
+        folder: pastaEfetiva,
         tmux_pane: envTmuxPane(),
       });
 
@@ -617,7 +621,7 @@ export const tools: ToolDef[] = [
         cargo: p.cargo,
         tarefa: p.tarefa,
         projeto: p.projeto,
-        pasta: p.pasta,
+        pasta: pastaEfetiva,
         areas: p.areas,
         arquivos_pretendidos: p.arquivos_pretendidos,
         agent,
@@ -644,7 +648,7 @@ export const tools: ToolDef[] = [
           `Agente: ${agent.name} [id=${agent.id}]`,
           `Papel: ${p.cargo}`,
           `Tarefa: ${p.tarefa}`,
-          `Pasta: ${p.pasta || "—"}`,
+          `Pasta: ${pastaEfetiva}`,
           `Tarefa principal (task_id): ${taskId}`,
           "",
           "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
@@ -1251,7 +1255,8 @@ export const tools: ToolDef[] = [
 
       const db = getDb();
       sweepSessions(db);
-      const folder = p.pasta || process.env.AGENTDESK_FOLDER || "";
+      // Sem pasta explícita, herda do ambiente (evita o balde 'default').
+      const folder = p.pasta || process.env.AGENTDESK_FOLDER || process.cwd();
       const teamKey = deriveTeamKey(folder, p.projeto);
       const pane = p.tmux_pane || envTmuxPane();
       let agent: AgentRow | null = null;
@@ -1481,7 +1486,7 @@ export const tools: ToolDef[] = [
       // duplicava agentes (Lara + Igor mesmo backend, mesma pasta).
       let effectiveFolder = p.pasta;
       if (!effectiveFolder) {
-        effectiveFolder = process.env.AGENTDESK_FOLDER || "";
+        effectiveFolder = process.env.AGENTDESK_FOLDER || process.cwd();
       }
 
       if (!agent && !p.force_new) {
