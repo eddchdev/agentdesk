@@ -202,6 +202,40 @@ function autoClaimNext(
   return null;
 }
 
+// Escopo padrão das tools de leitura. Com 4 projetos e 30+ agentes no mesmo
+// banco, o painel sem filtro vira lixo: o padrão agora é a equipe do chamador
+// (sessão > pasta explícita > AGENTDESK_FOLDER do Electron > cwd do processo
+// MCP, que o Claude Code inicia na pasta do projeto). todas_equipes=true é o
+// jeito explícito de ver tudo.
+function resolveTeamScope(db: Database.Database, args: any): string | null {
+  if (args?.todas_equipes) return null;
+  if (args?.session_id) {
+    try {
+      const session = requireActiveSession(db, args.session_id);
+      return teamKeyForSession(session, getAgentByActiveSession(db, session.id));
+    } catch {
+      // Sessão inválida não deve impedir a leitura; cai para os fallbacks.
+    }
+  }
+  const pasta = (typeof args?.pasta === "string" && args.pasta.trim())
+    || process.env.AGENTDESK_FOLDER
+    || process.cwd();
+  return deriveTeamKey(pasta, typeof args?.projeto === "string" ? args.projeto : null);
+}
+
+const ESCOPO_PROPS = {
+  session_id: { type: "string", description: "Escopo preferido: usa a equipe desta sessão (e renova o heartbeat)." },
+  pasta: { type: "string", description: "Escopo alternativo: pasta da equipe." },
+  projeto: { type: "string", description: "Escopo alternativo: nome do projeto." },
+  todas_equipes: { type: "boolean", default: false, description: "Mostra todas as equipes (visão global explícita)." },
+} as const;
+
+function cabecalhoEscopo(teamKey: string | null): string {
+  return teamKey
+    ? `EQUIPE: ${teamKey}  (use todas_equipes=true para ver todas)`
+    : "EQUIPE: todas";
+}
+
 // O sistema não sabe se um processo morreu; só sabe há quanto tempo não tem
 // notícia dele. "dead"/"suspect" secos afirmavam mais do que o sistema sabe
 // (e mentiam para agente que passa 20min só lendo código). A anotação diz o
@@ -629,27 +663,18 @@ export const tools: ToolDef[] = [
   {
     name: "listar_status",
     description:
-      "Mostra a equipe ativa, status (active/suspect/dead), travas de arquivo, tarefas em aberto e últimas mensagens. Use sempre antes de começar a trabalhar e periodicamente.",
+      "Mostra a equipe ativa, status (active/suspect/dead), travas de arquivo, tarefas em aberto e últimas mensagens. Filtra pela equipe do chamador por padrão; todas_equipes=true mostra tudo.",
     inputSchema: {
       type: "object",
-      properties: {
-        session_id: { type: "string", description: "Opcional — atualiza heartbeat se informado." },
-      },
+      properties: { ...ESCOPO_PROPS },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      let teamKey: string | null = null;
-      if (args?.session_id) {
-        try {
-          const session = requireActiveSession(db, args.session_id);
-          teamKey = teamKeyForSession(session, getAgentByActiveSession(db, session.id));
-          db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), args.session_id);
-        } catch {
-          /* ignore */
-        }
-      }
+      const teamKey = resolveTeamScope(db, args);
       const out = [
+        cabecalhoEscopo(teamKey),
+        "",
         renderAgents(db, teamKey),
         "",
         renderTeamContext(db, teamKey),
@@ -1088,7 +1113,7 @@ export const tools: ToolDef[] = [
   {
     name: "listar_chat",
     description:
-      "Lista mensagens recentes do chat da equipe. Pode filtrar por destinatário, tipo, e quantidade.",
+      "Lista mensagens recentes do chat da equipe do chamador (todas_equipes=true para o chat global). Pode filtrar por destinatário, tipo, e quantidade.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1096,44 +1121,36 @@ export const tools: ToolDef[] = [
         para: { type: "string", description: "Filtra por destinatário (nome ou papel atual)." },
         tipo: { type: "string", enum: ["falar", "pedir", "passar", "alerta", "decisao", "erro"] },
         desde_ts: { type: "number", description: "timestamp ms para filtrar mensagens posteriores." },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
+      const teamKey = resolveTeamScope(db, args);
       const rows = listChat(db, {
         limit: args?.limite ?? 30,
         to: args?.para ?? null,
         type: args?.tipo as ChatType | undefined,
         since: args?.desde_ts,
+        team_key: teamKey,
       });
-      if (!rows.length) return text("Sem mensagens.");
-      return text(rows.reverse().map(formatChatLine).join("\n"));
+      if (!rows.length) return text(`Sem mensagens. ${cabecalhoEscopo(teamKey)}`);
+      return text([cabecalhoEscopo(teamKey), ...rows.reverse().map(formatChatLine)].join("\n"));
     },
   },
 
   {
     name: "listar_contexto_time",
     description:
-      "Retorna o snapshot completo do contexto da equipe: sessões ativas, tarefas, travas, últimas decisões e progresso. Use antes de começar trabalho novo.",
+      "Retorna o snapshot completo do contexto da equipe do chamador: sessões ativas, tarefas, travas, últimas decisões e progresso. todas_equipes=true para a visão global.",
     inputSchema: {
       type: "object",
-      properties: {
-        session_id: { type: "string", description: "Opcional — atualiza heartbeat." },
-      },
+      properties: { ...ESCOPO_PROPS },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      let teamKey: string | null = null;
-      if (args?.session_id) {
-        try {
-          const session = requireActiveSession(db, args.session_id);
-          teamKey = teamKeyForSession(session, getAgentByActiveSession(db, session.id));
-          db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), args.session_id);
-        } catch {
-          /* ignore */
-        }
-      }
+      const teamKey = resolveTeamScope(db, args);
 
       const recentDecisions = db
         .prepare(
@@ -1150,6 +1167,8 @@ export const tools: ToolDef[] = [
         .all(teamKey, teamKey) as any[];
 
       const out: string[] = [];
+      out.push(cabecalhoEscopo(teamKey));
+      out.push("");
       out.push(renderAgents(db, teamKey));
       out.push("");
       out.push(renderTeamContext(db, teamKey));
@@ -1171,7 +1190,7 @@ export const tools: ToolDef[] = [
         out.push(`  [${time}] ${u.session_name} [${u.session_role}]: ${u.progress}`);
       }
       out.push("");
-      out.push(renderRecentChat(db, 15));
+      out.push(renderRecentChat(db, 15, teamKey));
 
       return text(out.join("\n"));
     },
@@ -1642,27 +1661,23 @@ export const tools: ToolDef[] = [
 
   {
     name: "listar_agentes",
-    description: "Lista agentes com nome, autoridade, papel atual, status, tarefa e atividade.",
+    description: "Lista agentes da equipe do chamador (todas_equipes=true para todos) com nome, autoridade, papel atual, status, tarefa e atividade.",
     inputSchema: {
       type: "object",
       properties: {
         incluir_arquivados: { type: "boolean", default: false },
-        session_id: { type: "string", description: "Opcional para limitar à equipe da sessão." },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      let teamKey: string | null = null;
-      if (args?.session_id) {
-        const session = requireActiveSession(db, args.session_id);
-        teamKey = teamKeyForSession(session, getAgentByActiveSession(db, session.id));
-      }
+      const teamKey = resolveTeamScope(db, args);
       const agents = teamKey
         ? listAgentsForTeam(db, teamKey, { include_archived: !!args?.incluir_arquivados })
         : listAgents(db, { include_archived: !!args?.incluir_arquivados });
-      if (!agents.length) return text("Nenhum agente registrado.");
-      const lines: string[] = [`Total: ${agents.length} agente(s).`, ""];
+      if (!agents.length) return text(`Nenhum agente registrado. ${cabecalhoEscopo(teamKey)}`);
+      const lines: string[] = [cabecalhoEscopo(teamKey), `Total: ${agents.length} agente(s).`, ""];
       for (const a of agents) {
         const sess = a.current_session_id
           ? (db.prepare("SELECT name, status FROM sessions WHERE id = ?").get(a.current_session_id) as
@@ -2194,20 +2209,27 @@ export const tools: ToolDef[] = [
   {
     name: "listar_tarefas_estruturadas",
     description:
-      "Lista work items estruturados. Pode filtrar por status, agente ou papel atual.",
+      "Lista work items estruturados da equipe do chamador (todas_equipes=true para todos). Pode filtrar por status, agente ou papel atual.",
     inputSchema: {
       type: "object",
       properties: {
         status: { type: "string", enum: ["queued", "claimed", "working", "blocked", "review", "done", "canceled"] },
         para: { type: "string", description: "Nome do agente ou papel atual." },
         limite: { type: "number", default: 30 },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
-      const rows = listWorkItems(db, { status: args?.status ?? null, assigned: args?.para ?? null, limit: args?.limite ?? 30 });
-      if (!rows.length) return text("Nenhum work item encontrado.");
-      return text(rows.map(formatWorkItem).join("\n\n"));
+      const teamKey = resolveTeamScope(db, args);
+      const rows = listWorkItems(db, {
+        status: args?.status ?? null,
+        assigned: args?.para ?? null,
+        limit: args?.limite ?? 30,
+        team_key: teamKey,
+      });
+      if (!rows.length) return text(`Nenhum work item encontrado. ${cabecalhoEscopo(teamKey)}`);
+      return text([cabecalhoEscopo(teamKey), "", ...rows.map(formatWorkItem)].join("\n\n"));
     },
   },
 

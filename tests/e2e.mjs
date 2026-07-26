@@ -391,7 +391,7 @@ async function run() {
     const r3 = await I.call("entrar_modo_auto", { session_id: sessId, ligar: true });
     assert(/já estava ATIVO/.test(I.text(r3)), "auto não é idempotente");
     // Listar agentes pra confirmar status persistido.
-    const r4 = await I.call("listar_agentes", {});
+    const r4 = await I.call("listar_agentes", { todas_equipes: true });
     assert(I.text(r4).includes(agId), "agente sumiu da listagem");
     await I.close();
   });
@@ -567,9 +567,9 @@ async function run() {
     await Q.call("criar_tarefa_estruturada", { session_id: qSess, titulo: "gc survivor" });
 
     // Lista deve conter o agente e ao menos um work item.
-    const listAg = await Q.call("listar_agentes", {});
+    const listAg = await Q.call("listar_agentes", { todas_equipes: true });
     assert(Q.text(listAg).includes(qId), "agente sumiu");
-    const listWi = await Q.call("listar_tarefas_estruturadas", {});
+    const listWi = await Q.call("listar_tarefas_estruturadas", { todas_equipes: true });
     assert(/gc survivor/.test(Q.text(listWi)), "work item sumiu");
     await Q.close();
   });
@@ -616,7 +616,7 @@ async function run() {
     // Heartbeat → sweep não deveria afetar
     await S.call("heartbeat", { session_id: sSess });
     await S.call("listar_status", { session_id: sSess });  // dispara sweep
-    const r2 = await S.call("listar_agentes", {});
+    const r2 = await S.call("listar_agentes", { todas_equipes: true });
     // Parse: encontra o bloco do agente pelo id e extrai o status do header.
     const lines = S.text(r2).split("\n");
     const idLineIdx = lines.findIndex((l) => l.includes(`id: ${sId}`));

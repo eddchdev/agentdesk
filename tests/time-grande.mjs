@@ -133,7 +133,7 @@ await test("painel: suspeito e morto mostram 'sem notícias há Xmin'", async ()
 
   // Suspeito: 2 minutos sem notícias.
   rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 120_000, sess);
-  const status = await call("listar_status", {});
+  const status = await call("listar_status", { pasta });
   assert(
     /suspect \(sem notícias há \d+min\)/.test(status),
     `EQUIPE ATIVA deveria anotar o tempo sem notícias:\n${status}`
@@ -141,7 +141,7 @@ await test("painel: suspeito e morto mostram 'sem notícias há Xmin'", async ()
 
   // Morto: 7 minutos sem notícias; o sweep marca e a lista de agentes anota.
   rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess);
-  const agentes = await call("listar_agentes", {});
+  const agentes = await call("listar_agentes", { pasta });
   assert(
     /dead \(sem notícias há \d+min\)/.test(agentes),
     `listar_agentes deveria anotar o tempo sem notícias:\n${agentes}`
@@ -210,6 +210,35 @@ await test("faxina: auto-close devolve as tasks da sessão (sem zumbi in_progres
   assert(sess.status === "closed", `sessão deveria auto-fechar: ${sess.status}`);
   const task = rawDb().prepare("SELECT status FROM tasks WHERE session_id = ?").get(sessId);
   assert(task.status === "pending", `task deveria voltar para 'pending', ficou '${task.status}'`);
+});
+
+// ─── escopo por equipe ───────────────────────────────────────────────────────
+
+await test("painel: filtra pela equipe por padrão; todas_equipes mostra tudo", async () => {
+  const pastaA = join(TMP, "proj-escopo-a");
+  const pastaB = join(TMP, "proj-escopo-b");
+  const a = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-escopo-a", pasta: pastaA });
+  const b = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-escopo-b", pasta: pastaB });
+  const sessA = a.match(/\(id=([\w-]+)\)/)?.[1];
+  const sessB = b.match(/\(id=([\w-]+)\)/)?.[1];
+  await call("enviar_mensagem", { session_id: sessA, mensagem: "conversa do projeto A" });
+  await call("enviar_mensagem", { session_id: sessB, mensagem: "conversa do projeto B" });
+
+  const soA = await call("listar_status", { pasta: pastaA });
+  assert(soA.includes("tarefa-escopo-a"), `equipe A sumiu do próprio painel:\n${soA}`);
+  assert(!soA.includes("tarefa-escopo-b"), `painel da equipe A vazou a equipe B:\n${soA}`);
+
+  const chatA = await call("listar_chat", { session_id: sessA });
+  assert(
+    chatA.includes("conversa do projeto A") && !chatA.includes("conversa do projeto B"),
+    `chat da equipe A veio misturado:\n${chatA}`
+  );
+
+  const tudo = await call("listar_status", { todas_equipes: true });
+  assert(
+    tudo.includes("tarefa-escopo-a") && tudo.includes("tarefa-escopo-b"),
+    "todas_equipes=true deveria mostrar as duas equipes"
+  );
 });
 
 // ─── relatório ───────────────────────────────────────────────────────────────
