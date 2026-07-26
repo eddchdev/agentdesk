@@ -347,6 +347,56 @@ await test("handoff: quem recebe vê o que foi decidido e tentado, não só a no
   assert(inbox.includes("Decidi usar fila local"), `handoff sem as decisões de quem passou:\n${inbox}`);
 });
 
+// ─── corridas de abertura (revisão adversarial) ──────────────────────────────
+
+await test("retomada não sequestra agente que já está ativo em outra sessão", async () => {
+  const pasta = join(TMP, "equipe-sequestro");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-seq", pasta });
+  const sess1 = um.match(/\(id=([\w-]+)\)/)?.[1];
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+
+  // Sessão 1 morre; o agente é retomado e passa a trabalhar numa sessão NOVA.
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess1);
+  await call("listar_status", { pasta });
+  const dois = await call("abrir", { pasta, retomar_agente_id: agentId });
+  const sess2 = grab(dois, "session_id");
+  assert(sess2 && sess2 !== sess1, `retomada deveria usar sessão nova (veio ${sess2})`);
+
+  // Janela intrusa tenta abrir a mesma tarefa da sessão morta: não pode
+  // repontar o agente (sequestro) nem reabrir a sessão antiga por baixo dele.
+  let recusa = null;
+  try {
+    await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-seq", pasta });
+  } catch (e) {
+    recusa = e.message;
+  }
+  const ag = rawDb().prepare("SELECT current_session_id FROM agents WHERE id = ?").get(agentId);
+  assert(
+    ag.current_session_id === sess2,
+    `agente foi sequestrado: aponta para ${ag.current_session_id}, deveria seguir em ${sess2} (recusa=${recusa})`
+  );
+});
+
+await test("retomada reaproveita a task do mesmo título (sem pilha de in_progress)", async () => {
+  const pasta = join(TMP, "equipe-pilha");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-pilha", pasta });
+  const sess = um.match(/\(id=([\w-]+)\)/)?.[1];
+
+  for (let ciclo = 1; ciclo <= 3; ciclo++) {
+    rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess);
+    await call("listar_status", { pasta });
+    const r = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-pilha", pasta });
+    assert(/retomada/.test(r), `ciclo ${ciclo}: deveria retomar a sessão morta:\n${r}`);
+  }
+
+  const n = rawDb().prepare(
+    "SELECT COUNT(*) AS n FROM tasks WHERE session_id = ? AND status = 'in_progress'"
+  ).get(sess).n;
+  assert(n === 1, `3 restarts deveriam manter 1 task in_progress, tem ${n}`);
+  const feito = await call("marcar_feito", { session_id: sess, resumo: "fim sem ambiguidade" });
+  assert(/concluída/.test(feito), `marcar_feito falhou: ${feito}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

@@ -111,6 +111,54 @@ process.exit(0);
   );
 }
 
+// ─── 2. dedup do abrir_sessao sob corrida real ───────────────────────────────
+// Duas "janelas" (processos) chamam abrir_sessao com o MESMO cargo+tarefa no
+// mesmo instante (barreira de tempo). O dedup precisa deixar viva exatamente
+// uma sessão por tarefa.
+
+const JANELA = join(TMP, "janela.mjs");
+writeFileSync(JANELA, `
+const [dbPath, barrier, tarefa, pasta, dist] = process.argv.slice(2);
+process.env.AGENTDESK_DB = dbPath;
+process.env.AGENTDESK_BROKER_URL = "ws://127.0.0.1:1";
+const { tools } = await import(dist + "/tools.js");
+const h = tools.find((t) => t.name === "abrir_sessao").handler;
+const b = Number(barrier);
+while (Date.now() < b) { /* espera a barreira para maximizar a colisao */ }
+try {
+  h({ cargo: "backend", tarefa, pasta });
+  console.log("OK");
+} catch (e) {
+  console.log("ERR|" + e.message.slice(0, 80));
+}
+process.exit(0);
+`);
+
+{
+  const db = new Database(DB);
+  let furou = 0;
+  const rounds = 8;
+  for (let round = 1; round <= rounds; round++) {
+    const tarefa = `tarefa-corrida-${round}`;
+    const pasta = join(TMP, "proj-corrida");
+    const barrier = Date.now() + 600;
+    await Promise.all([
+      spawnNode(JANELA, [DB, String(barrier), tarefa, pasta, DIST]),
+      spawnNode(JANELA, [DB, String(barrier), tarefa, pasta, DIST]),
+    ]);
+    const vivas = db.prepare(
+      "SELECT COUNT(*) AS n FROM sessions WHERE task = ? AND status != 'closed'"
+    ).get(tarefa).n;
+    if (vivas > 1) furou++;
+  }
+  report(
+    "duas janelas simultâneas não criam sessão duplicada para a mesma tarefa",
+    furou === 0,
+    furou ? `dedup furado em ${furou}/${rounds} rodadas` : `${rounds} rodadas limpas`
+  );
+  db.close();
+}
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

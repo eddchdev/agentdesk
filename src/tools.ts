@@ -423,29 +423,63 @@ function openSession(db: Database.Database, p: OpenSessionInput): { sessionId: s
   return { sessionId: id, sessionName: name, taskId, ts };
 }
 
-// Ressuscita uma sessão dead (sem fechar e reabrir). Só cria task nova se a tarefa mudou.
+// Ressuscita uma sessão dead (sem fechar e reabrir). Tudo numa transação
+// IMMEDIATE com guardas: sem elas, duas janelas retomavam a MESMA sessão ao
+// mesmo tempo, e uma janela podia sequestrar um agente que já trabalhava em
+// outra sessão viva (current_session_id repontado por baixo da janela dona).
 function reopenSession(
   db: Database.Database,
   sessionId: string,
   newTask: string,
   agent: AgentRow
 ): { sessionId: string; sessionName: string; taskId: string; ts: number } {
-  const ts = now();
-  const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as any;
-  db.prepare(
-    "UPDATE sessions SET last_heartbeat = ?, status = 'active', task = ? WHERE id = ?"
-  ).run(ts, newTask, sessionId);
+  const tx = db.transaction(() => {
+    const ts = now();
+    const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as SessionRow | undefined;
+    if (!session || session.closed_at || session.status === "closed") {
+      throw new Error(`Sessão ${sessionId} não está mais disponível para retomada.`);
+    }
+    const st = deriveStatus(session);
+    if (st === "active" || st === "suspect") {
+      throw new Error(`Sessão ${session.name} já está ativa (outra janela retomou primeiro).`);
+    }
+    const atual = findAgentById(db, agent.id);
+    if (atual?.current_session_id && atual.current_session_id !== sessionId) {
+      const outra = db.prepare("SELECT * FROM sessions WHERE id = ?").get(atual.current_session_id) as SessionRow | undefined;
+      if (outra && ["active", "suspect"].includes(deriveStatus(outra))) {
+        throw new Error(
+          `Agente ${agent.name} já está ativo em outra sessão (${outra.name}). Use aquela sessão ou feche-a antes.`
+        );
+      }
+    }
 
-  const taskId = newId();
-  db.prepare(
-    `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
-  ).run(taskId, sessionId, newTask, newTask, ts, ts);
+    db.prepare(
+      "UPDATE sessions SET last_heartbeat = ?, status = 'active', task = ? WHERE id = ?"
+    ).run(ts, newTask, sessionId);
 
-  setAgentStatus(db, agent.id, "working", { current_session_id: sessionId, current_task_id: taskId });
-  touchAgent(db, agent.id);
+    // Reaproveita a task in_progress de mesmo título: cada restart criava uma
+    // nova e, depois de alguns ciclos, marcar_feito falhava por ambiguidade.
+    const existente = db.prepare(
+      "SELECT id FROM tasks WHERE session_id = ? AND status = 'in_progress' AND title = ? ORDER BY created_at DESC LIMIT 1"
+    ).get(sessionId, newTask) as { id: string } | undefined;
+    let taskId: string;
+    if (existente) {
+      taskId = existente.id;
+      db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(ts, taskId);
+    } else {
+      taskId = newId();
+      db.prepare(
+        `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
+      ).run(taskId, sessionId, newTask, newTask, ts, ts);
+    }
 
-  return { sessionId, sessionName: session.name, taskId, ts };
+    setAgentStatus(db, agent.id, "working", { current_session_id: sessionId, current_task_id: taskId });
+    touchAgent(db, agent.id);
+
+    return { sessionId, sessionName: session.name, taskId, ts };
+  });
+  return tx.immediate() as { sessionId: string; sessionName: string; taskId: string; ts: number };
 }
 
 function getAgentByActiveSession(db: Database.Database, sessionId: string): AgentRow | null {
@@ -589,80 +623,93 @@ export const tools: ToolDef[] = [
       // Proteção contra duplicata: na operação real, o retry do cliente após
       // um falso-morto criava dois agentes com o mesmo cargo e a mesma tarefa
       // ("um morto e um trabalhando"). Sessão viva igual recusa; morta retoma.
+      // Decisão E criação na MESMA transação IMMEDIATE: sem isso, duas janelas
+      // simultâneas passavam ambas pelo SELECT antes de qualquer INSERT e a
+      // duplicata voltava pela porta da corrida.
       const dedupTeamKey = deriveTeamKey(pastaEfetiva, p.projeto);
-      if (!p.force_new) {
-        const iguais = db.prepare(
-          `SELECT * FROM sessions
-           WHERE team_key = ? AND role = ? AND task = ? AND status != 'closed' AND closed_at IS NULL
-           ORDER BY last_heartbeat DESC`
-        ).all(dedupTeamKey, p.cargo, p.tarefa) as SessionRow[];
-        for (const existente of iguais) {
-          const st = deriveStatus(existente);
-          if (st === "active" || st === "suspect") {
-            const quem = existente.agent_name || existente.name;
-            throw new Error(
-              `Já existe ${quem} trabalhando nesta mesma tarefa (sessão ${existente.name}, ` +
-                `session_id=${existente.id}, status=${st}). Para continuar aquele trabalho, ` +
-                `use abrir com retomar_agente_id; para criar mesmo assim um segundo agente, ` +
-                `re-chame com force_new=true.`
-            );
-          }
-          if (st === "dead" && existente.agent_id) {
-            const dono = findAgentById(db, existente.agent_id);
-            if (dono && dono.status !== "archived") {
-              const reaberta = reopenSession(db, existente.id, p.tarefa, dono);
-              recordEvent(db, reaberta.sessionId, "session.reopened_dedup", {
-                agent_id: dono.id,
-                role: p.cargo,
-                task: p.tarefa,
-              });
-              postChat(db, {
-                sessionId: reaberta.sessionId,
-                sessionName: reaberta.sessionName,
-                role: p.cargo,
-                type: "falar",
-                agentId: dono.id,
-                agentName: dono.name,
-                message: `Voltei. Retomando a mesma tarefa: ${p.tarefa}.`,
-              });
-              return text(
-                [
-                  `Sessão retomada (não duplicada): ${reaberta.sessionName} (id=${reaberta.sessionId})`,
-                  `Agente: ${dono.name} [id=${dono.id}]`,
-                  `Papel: ${p.cargo}`,
-                  `Tarefa: ${p.tarefa}`,
-                  `Tarefa principal (task_id): ${reaberta.taskId}`,
-                  "",
-                  "Havia uma sessão sem notícias com este mesmo cargo e tarefa; ela foi reaproveitada.",
-                  "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
-                ].join("\n")
+      type Abertura =
+        | { tipo: "retomada"; dono: AgentRow; reaberta: { sessionId: string; sessionName: string; taskId: string; ts: number } }
+        | { tipo: "nova"; agent: AgentRow; opened: { sessionId: string; sessionName: string; taskId: string; ts: number } };
+      const abertura = db.transaction((): Abertura => {
+        if (!p.force_new) {
+          const iguais = db.prepare(
+            `SELECT * FROM sessions
+             WHERE team_key = ? AND role = ? AND task = ? AND status != 'closed' AND closed_at IS NULL
+             ORDER BY last_heartbeat DESC`
+          ).all(dedupTeamKey, p.cargo, p.tarefa) as SessionRow[];
+          for (const existente of iguais) {
+            const st = deriveStatus(existente);
+            if (st === "active" || st === "suspect") {
+              const quem = existente.agent_name || existente.name;
+              throw new Error(
+                `Já existe ${quem} trabalhando nesta mesma tarefa (sessão ${existente.name}, ` +
+                  `session_id=${existente.id}, status=${st}). Para continuar aquele trabalho, ` +
+                  `use abrir com retomar_agente_id; para criar mesmo assim um segundo agente, ` +
+                  `re-chame com force_new=true.`
               );
+            }
+            if (st === "dead" && existente.agent_id) {
+              const dono = findAgentById(db, existente.agent_id);
+              if (dono && dono.status !== "archived") {
+                return { tipo: "retomada", dono, reaberta: reopenSession(db, existente.id, p.tarefa, dono) };
+              }
             }
           }
         }
+        // Legacy: cria agente novo. Pra retomada por nome use abrir_ou_retornar_agente.
+        const novoAgente = createAgent(db, {
+          name: pickUniqueName(db),
+          role: p.cargo,
+          project: p.projeto,
+          folder: pastaEfetiva,
+          tmux_pane: envTmuxPane(),
+        });
+        const opened = openSession(db, {
+          cargo: p.cargo,
+          tarefa: p.tarefa,
+          projeto: p.projeto,
+          pasta: pastaEfetiva,
+          areas: p.areas,
+          arquivos_pretendidos: p.arquivos_pretendidos,
+          agent: novoAgente,
+        });
+        return { tipo: "nova", agent: novoAgente, opened };
+      }).immediate() as Abertura;
+
+      if (abertura.tipo === "retomada") {
+        const { dono, reaberta } = abertura;
+        recordEvent(db, reaberta.sessionId, "session.reopened_dedup", {
+          agent_id: dono.id,
+          role: p.cargo,
+          task: p.tarefa,
+        });
+        postChat(db, {
+          sessionId: reaberta.sessionId,
+          sessionName: reaberta.sessionName,
+          role: p.cargo,
+          type: "falar",
+          agentId: dono.id,
+          agentName: dono.name,
+          message: `Voltei. Retomando a mesma tarefa: ${p.tarefa}.`,
+        });
+        return text(
+          [
+            `Sessão retomada (não duplicada): ${reaberta.sessionName} (id=${reaberta.sessionId})`,
+            `Agente: ${dono.name} [id=${dono.id}]`,
+            `Papel: ${p.cargo}`,
+            `Tarefa: ${p.tarefa}`,
+            `Tarefa principal (task_id): ${reaberta.taskId}`,
+            "",
+            "Havia uma sessão sem notícias com este mesmo cargo e tarefa; ela foi reaproveitada.",
+            "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
+          ].join("\n")
+        );
       }
 
-      // Legacy: cria agente novo. Pra retomada por nome use abrir_ou_retornar_agente.
-      const agentName = pickUniqueName(db);
-      const agent = createAgent(db, {
-        name: agentName,
-        role: p.cargo,
-        project: p.projeto,
-        folder: pastaEfetiva,
-        tmux_pane: envTmuxPane(),
-      });
+      const { agent, opened } = abertura;
+      const { sessionId, sessionName, taskId } = opened;
 
-      const { sessionId, sessionName, taskId } = openSession(db, {
-        cargo: p.cargo,
-        tarefa: p.tarefa,
-        projeto: p.projeto,
-        pasta: pastaEfetiva,
-        areas: p.areas,
-        arquivos_pretendidos: p.arquivos_pretendidos,
-        agent,
-      });
-
-      recordEvent(db, sessionId, "session.opened", { name: sessionName, role: p.cargo, task: p.tarefa, agent: agentName });
+      recordEvent(db, sessionId, "session.opened", { name: sessionName, role: p.cargo, task: p.tarefa, agent: agent.name });
       postChat(db, {
         sessionId,
         sessionName,
