@@ -909,7 +909,11 @@ export const tools: ToolDef[] = [
          WHERE session_id = ? OR task_id = ?
          ORDER BY created_at DESC LIMIT 5`
       ).all(s.id, taskId) as Array<{ progress: string; created_at: number }>;
-      const notaCompleta = [
+      // Limites duros: um trabalhador verboso não pode explodir o inbox de
+      // quem recebe (a nota inteira é impressa no inbox e no tick detalhado).
+      const resumir = (texto: string, max: number) =>
+        texto.length > max ? `${texto.slice(0, max - 1)}…` : texto;
+      let notaCompleta = [
         args.nota,
         tarefaPassada ? `Tarefa: ${tarefaPassada.title}` : null,
         ...(historico.length
@@ -917,11 +921,12 @@ export const tools: ToolDef[] = [
               "O que já foi feito/decidido (mais recente primeiro):",
               ...historico.map((u) => {
                 const quando = new Date(u.created_at).toISOString().replace("T", " ").slice(0, 16);
-                return `  - [${quando}] ${u.progress}`;
+                return `  - [${quando}] ${resumir(u.progress, 300)}`;
               }),
             ]
           : []),
       ].filter(Boolean).join("\n");
+      notaCompleta = resumir(notaCompleta, 4000);
 
       const ts = now();
       const hid = newId();

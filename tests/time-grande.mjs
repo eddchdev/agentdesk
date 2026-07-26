@@ -483,6 +483,21 @@ await test("arquivado: nenhuma retomada acidental; desarquivar_agente reativa", 
   assert(volta.includes(agentId), `retomada após desarquivar falhou:\n${volta}`);
 });
 
+// ─── handoff limitado ────────────────────────────────────────────────────────
+
+await test("handoff: nota com histórico é limitada (update gigante não explode o inbox)", async () => {
+  const pasta = join(TMP, "equipe-handoff-grande");
+  const a = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-grande", pasta });
+  const sessA = a.match(/\(id=([\w-]+)\)/)?.[1];
+  for (let i = 0; i < 5; i++) {
+    await call("atualizar_progresso", { session_id: sessA, progresso: `update ${i} ${"x".repeat(10_000)}` });
+  }
+  await call("passar_tarefa", { session_id: sessA, destinatario: "revisor-grande", nota: "segue" });
+  const nota = rawDb().prepare("SELECT note FROM handoffs WHERE to_target = 'revisor-grande'").get().note;
+  assert(nota.length <= 4000, `nota do handoff deveria ser limitada a 4000, tem ${nota.length}`);
+  assert(nota.includes("segue") && /update 4/.test(nota), `nota truncada perdeu o essencial:\n${nota.slice(0, 200)}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;
