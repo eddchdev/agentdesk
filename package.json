@@ -10,10 +10,11 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "npm run build && npm run test:e2e && npm run test:autonomia && npm run test:time-grande",
+    "test": "npm run build && npm run test:e2e && npm run test:autonomia && npm run test:time-grande && npm run test:concorrencia",
     "test:e2e": "node tests/e2e.mjs",
     "test:autonomia": "node tests/autonomia.mjs",
     "test:time-grande": "node tests/time-grande.mjs",
+    "test:concorrencia": "node tests/concorrencia.mjs",
     "test:broker": "node tests/broker.mjs",
     "test:all": "npm test && npm run test:broker"
   },

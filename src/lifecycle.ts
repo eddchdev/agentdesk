@@ -39,12 +39,6 @@ export function deriveStatus(row: { last_heartbeat: number; status: SessionStatu
 export const AUTO_CLOSE_AFTER_MS = 30 * 60_000;
 
 export function sweepSessions(db: Database.Database): { marked_dead: string[]; released_locks: number } {
-  const rows = db
-    .prepare(
-      "SELECT id, name, last_heartbeat, status, closed_at, agent_id FROM sessions WHERE status IN ('active','suspect')"
-    )
-    .all() as { id: string; name: string; last_heartbeat: number; status: SessionStatus; closed_at: number | null; agent_id: string | null }[];
-
   const markedDead: string[] = [];
   const updateStatus = db.prepare("UPDATE sessions SET status = ? WHERE id = ?");
   const releaseLocks = db.prepare(
@@ -61,6 +55,17 @@ export function sweepSessions(db: Database.Database): { marked_dead: string[]; r
   const ts = now();
 
   const tx = db.transaction(() => {
+    // O snapshot precisa ser lido DENTRO da transação IMMEDIATE. Antes ele era
+    // lido fora: entre a leitura e o commit, outro processo podia renovar o
+    // heartbeat (requireActiveSession), e o sweep condenava como morta uma
+    // sessão que tinha acabado de provar vida, soltando as travas dela em
+    // silêncio. Com BEGIN IMMEDIATE, ou a renovação commitou antes (e o
+    // snapshot a enxerga), ou ela espera o sweep terminar.
+    const rows = db
+      .prepare(
+        "SELECT id, name, last_heartbeat, status, closed_at, agent_id FROM sessions WHERE status IN ('active','suspect')"
+      )
+      .all() as { id: string; name: string; last_heartbeat: number; status: SessionStatus; closed_at: number | null; agent_id: string | null }[];
     for (const r of rows) {
       const newStatus = deriveStatus(r);
       if (newStatus !== r.status) {
