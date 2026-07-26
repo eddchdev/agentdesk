@@ -22,6 +22,7 @@ export interface SessionRow {
   last_heartbeat: number;
   status: SessionStatus;
   closed_at: number | null;
+  agent_id?: string | null;
 }
 
 export function deriveStatus(row: { last_heartbeat: number; status: SessionStatus; closed_at: number | null }): SessionStatus {
@@ -92,7 +93,26 @@ export function requireActiveSession(db: Database.Database, sessionId: string): 
   if (!row) throw new Error(`Sessão ${sessionId} não encontrada. Use /abrir antes.`);
   const status = deriveStatus(row);
   if (status === "closed") throw new Error(`Sessão ${row.name} já foi fechada.`);
-  if (status === "dead") throw new Error(`Sessão ${row.name} foi marcada como morta (sem heartbeat). Abra uma nova com /abrir.`);
+
+  // Chamar uma ferramenta é o sinal de vida mais forte que o sistema tem.
+  // Este é o ponto único por onde toda tool com session_id passa, então a
+  // renovação vale para todas (antes só algumas renovavam, e um gerente que
+  // usava apenas distribuir_tarefas/revisar_tarefa "morria" trabalhando).
+  // Sessão marcada dead ressuscita: o processo evidentemente está vivo.
+  // Travas que o sweep liberou enquanto a sessão esteve "morta" NÃO voltam
+  // sozinhas (outro agente pode tê-las tomado); o dono retrava se precisar.
+  const ts = now();
+  db.prepare("UPDATE sessions SET last_heartbeat = ?, status = 'active' WHERE id = ?").run(ts, row.id);
+  if (row.agent_id) {
+    db.prepare(
+      `UPDATE agents SET last_heartbeat = ?, updated_at = ?,
+         status = CASE WHEN status = 'dead' THEN 'working' ELSE status END,
+         current_session_id = COALESCE(current_session_id, ?)
+       WHERE id = ? AND status != 'archived'`
+    ).run(ts, ts, row.id, row.agent_id);
+  }
+  row.last_heartbeat = ts;
+  row.status = "active";
   return row;
 }
 
