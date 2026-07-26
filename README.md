@@ -4,93 +4,55 @@
 
 # AgentDesk
 
-**Transforme várias sessões do Claude Code numa equipe coordenada.**
+**Abra as sessões. Entregue a lista ao gerente. A equipe executa em paralelo.**
 
-Um servidor MCP que dá a múltiplas instâncias do Claude Code uma identidade persistente, um chat compartilhado, locks cooperativos de arquivos, work items, worktrees isoladas e modo autônomo — tudo num banco SQLite local.
+Um servidor MCP local para transformar várias sessões de agente em uma equipe autônoma: gerente único por escopo, papéis dinâmicos, distribuição de tarefas em lote, locks cooperativos, worktrees e contexto incremental em SQLite.
 
 <p>
   <a href="https://github.com/eddchdev/agentdesk/stargazers"><img src="https://img.shields.io/github/stars/eddchdev/agentdesk?style=for-the-badge&logo=github&color=FFB000&labelColor=0a0a0a" alt="GitHub stars" /></a>
   <img src="https://img.shields.io/badge/Claude_Code-MCP-D97757?style=for-the-badge&logo=anthropic&logoColor=white&labelColor=0a0a0a" alt="Claude Code MCP" />
   <img src="https://img.shields.io/badge/TypeScript-5.6-3178C6?style=for-the-badge&logo=typescript&logoColor=white&labelColor=0a0a0a" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Node-≥18-339933?style=for-the-badge&logo=node.js&logoColor=white&labelColor=0a0a0a" alt="Node 18+" />
   <img src="https://img.shields.io/badge/SQLite-WAL-003B57?style=for-the-badge&logo=sqlite&logoColor=white&labelColor=0a0a0a" alt="SQLite" />
-  <img src="https://img.shields.io/badge/Electron-Desktop-47848F?style=for-the-badge&logo=electron&logoColor=white&labelColor=0a0a0a" alt="Electron" />
-  <img src="https://img.shields.io/badge/License-MIT-A0A0A0?style=for-the-badge&labelColor=0a0a0a" alt="MIT License" />
+  <img src="https://img.shields.io/badge/Electron-Desktop-47848F?style=for-the-badge&logo=electron&labelColor=0a0a0a" alt="Electron" />
 </p>
 
-[Instalação](#-instalação) · [Como funciona](#-como-funciona) · [Conceitos](#-conceitos) · [Comandos](#-comandos) · [Exemplo ao vivo](#-exemplo-ao-vivo) · [Desktop](#%EF%B8%8F-desktop-opcional)
+[Início rápido](#-início-rápido) · [Fluxo autônomo](#-fluxo-autônomo) · [Papéis dinâmicos](#-papéis-dinâmicos) · [Tools](#-tools-mcp) · [Desktop](#%EF%B8%8F-desktop-opcional)
 
 </div>
 
 ---
 
-## 💡 Por que AgentDesk?
+## O que mudou
 
-Quando você abre **mais de um Claude Code ao mesmo tempo**, cada um vira uma ilha: sem saber dos outros, sobrescrevendo arquivos, repetindo trabalho, perdendo contexto entre janelas.
+O fluxo principal não pede mais que você monte a equipe cargo por cargo nem fique aprovando cada próximo passo.
 
-O AgentDesk resolve isso com **uma única tool MCP compartilhada** entre todas as sessões.
+- Toda janela começa apenas com **`/abrir`**.
+- A primeira sessão do escopo vira o **gerente único**; as demais entram como **disponíveis**.
+- Todas entram em modo autônomo no onboarding. Não é necessário ligar `/auto` separadamente.
+- O gerente atribui um **papel livre e temporário** a cada agente conforme o trabalho real.
+- Você pode entregar uma lista inteira ao gerente; ele cria e distribui os work items em lote.
+- Ao terminar ou bloquear uma tarefa, o trabalhador procura a próxima tarefa pronta. Ele não fica parado esperando revisão ou uma decisão rotineira do gerente.
 
-<table>
-<tr>
-<td width="50%" valign="top">
-
-### 🆔 Agentes persistentes
-Cada Claude recebe **nome humano + cargo** (`Jonathan/frontend`, `Camila/backend`). Fecha a janela, volta semana que vem — retoma o mesmo agente, com histórico.
-
-</td>
-<td width="50%" valign="top">
-
-### 🔒 Locks cooperativos
-Antes de editar, o Claude `trava` arquivos ou escopos (`api/**`, `src/painel/**/*.tsx`). Outro Claude vê o lock e espera ou pede pra liberar.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-### 💬 Chat interno
-Mensagens curtas entre sessões: `falar`, `pedir`, `passar`, `alerta`, `decisao`. Aparece pra todos com timestamp e quem mandou.
-
-</td>
-<td valign="top">
-
-### 📋 Work items + worktrees
-Tarefas estruturadas com dono, escopos, critério de aceite. Ao assumir, o MCP cria uma **worktree git isolada** e trava os escopos automaticamente.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-### 🤖 Modo autônomo
-`/auto` coloca o agente num loop self-paced que checa inbox a cada 30s-5min, responde alertas e dá um passo na tarefa atual — sem você digitar nada.
-
-</td>
-<td valign="top">
-
-### 🖥️ Desktop opcional
-Painel Electron read-only mostra a equipe inteira: agentes, chat, locks, work items, terminais embutidos por agente.
-
-</td>
-</tr>
-</table>
+“Gerente” é autoridade de coordenação. “Papel” é a especialidade atual. Os dois conceitos não são mais misturados.
 
 ---
 
-## 🚀 Instalação
+## 🚀 Início rápido
+
+### 1. Instale
 
 ```bash
 git clone https://github.com/eddchdev/agentdesk.git
 cd agentdesk
-npm install      # ou: bun install
-npm run build    # gera dist/index.js
+npm install
+npm run build
 ```
 
-> **Modo dev (sem build):** `npm run dev`
+Requer Node.js 18 ou superior.
 
-### Registrar como servidor MCP no Claude Code
+### 2. Registre o MCP
 
-Adicione ao seu `~/.claude.json` (ou config equivalente):
+Adicione ao `~/.claude.json` ou à configuração equivalente:
 
 ```jsonc
 {
@@ -103,216 +65,247 @@ Adicione ao seu `~/.claude.json` (ou config equivalente):
 }
 ```
 
-Reinicie o Claude Code. Pronto — as tools (`abrir_ou_retornar_agente`, `listar_status`, ...) ficam disponíveis em **todas** as suas janelas, e todas falam com o mesmo banco em `~/.agentdesk/agentdesk.db`.
+Reinicie o cliente. O banco compartilhado fica em `~/.agentdesk/agentdesk.db`.
 
-> Veja `mcp-config.example.json` para a versão completa (com modo dev `tsx`).
+> Para desenvolvimento sem build, veja `mcp-config.example.json`.
+
+### 3. Abra a equipe
+
+Na primeira janela, dentro da pasta do projeto:
+
+```text
+você: /abrir
+```
+
+O AgentDesk cria ou retoma o gerente daquele escopo e já ativa o modo autônomo.
+
+Abra quantas janelas adicionais quiser, na mesma pasta, e diga a mesma coisa em cada uma:
+
+```text
+você: /abrir
+```
+
+Cada nova sessão entra como agente disponível. O gerente enxerga a capacidade nova, atribui o papel apropriado e inclui o agente no trabalho sem exigir configuração manual de cargo.
+
+### 4. Dê a lista ao gerente uma vez
+
+Na janela do gerente, use linguagem natural:
+
+```text
+Implemente esta lista usando a equipe em paralelo:
+
+1. criar o endpoint de importação de leads;
+2. montar a tela de pré-visualização;
+3. cobrir regras de duplicidade com testes;
+4. revisar a integração e validar o fluxo completo.
+
+Evite conflito de arquivos e me avise apenas se houver uma decisão irreversível.
+```
+
+O gerente transforma a lista em work items, identifica dependências e escopos, atribui papéis e distribui o lote entre os agentes menos carregados.
+
+> O MCP **não inicia processos do Claude Code nem cria capacidade de agente**. Você abre a quantidade de janelas que deseja usar; a partir daí o gerente coordena essas sessões.
 
 ---
 
-## 🧭 Como funciona
+## ⚡ Fluxo autônomo
 
 ```mermaid
 flowchart LR
-    subgraph Claude1["🧠 Claude Code · janela 1"]
-        A1[Jonathan/frontend]
-    end
-    subgraph Claude2["🧠 Claude Code · janela 2"]
-        A2[Camila/backend]
-    end
-    subgraph Claude3["🧠 Claude Code · janela 3"]
-        A3[Marta/qa]
-    end
-
-    MCP[("🧩 AgentDesk MCP<br/>(stdio)")]
-    DB[("🗄️ SQLite<br/>~/.agentdesk/agentdesk.db")]
-    Watcher{{"📡 Watcher tmux<br/>(opcional)"}}
-    Desktop["🖥️ Electron desktop<br/>(read-only)"]
-
-    A1 <--> MCP
-    A2 <--> MCP
-    A3 <--> MCP
-    MCP <--> DB
-    Watcher -.observa.-> DB
-    Watcher -.send-keys.-> Claude1
-    Desktop -.read.-> DB
+    U["Você entrega objetivo ou lista"] --> G["Gerente único"]
+    G --> D["Distribuição em lote"]
+    D --> A1["Agente A"]
+    D --> A2["Agente B"]
+    D --> A3["Agente C"]
+    A1 --> N["Próximo item pronto"]
+    A2 --> N
+    A3 --> N
+    N --> R["Validação e integração"]
+    R --> G
 ```
 
-Toda janela do Claude Code conversa com o **mesmo** processo MCP via stdio. O MCP guarda tudo num SQLite local. O watcher externo (opcional) cutuca panes do tmux quando entra mensagem urgente, pra modo autônomo reagir mais rápido. O desktop Electron lê o banco em modo só-leitura.
+Cada trabalhador segue este ciclo:
+
+1. Recebe somente as mudanças novas do inbox e da fila.
+2. Assume automaticamente o próximo work item pronto que lhe foi atribuído.
+3. Trava os escopos necessários e usa worktree quando configurada.
+4. Executa, valida e entrega o resultado.
+5. Procura imediatamente outro item pronto, sem esperar a revisão anterior.
+
+Se houver bloqueio real, o agente registra causa e evidência, libera o que não precisa mais ficar travado, avisa o gerente e continua em outro item independente. O gerente replaneja de forma assíncrona.
+
+### O que o agente decide sozinho
+
+- escolhas locais, reversíveis e dentro do critério de aceite;
+- organização interna, testes e pequenos refactors no próprio escopo;
+- ordem de execução entre itens independentes;
+- correções necessárias para fazer a validação passar.
+
+### O que deve ser escalado
+
+- ação destrutiva ou difícil de reverter;
+- mudança de produto que altera o objetivo ou o critério de aceite;
+- segredo, credencial, publicação ou efeito externo sem autorização;
+- conflito de escopo que não possa ser resolvido por redistribuição;
+- falta de informação que permita resultados materialmente diferentes.
+
+Essa fronteira evita dois extremos: agentes passivos pedindo permissão para tudo e agentes tomando decisões de alto impacto sem contexto.
 
 ---
 
-## 🧩 Conceitos
+## 🧭 Papéis dinâmicos
 
-<details>
-<summary><b>Agente vs Sessão</b></summary>
+Não existe catálogo obrigatório de `backend`, `frontend`, `qa`, `bugs` ou qualquer outro cargo.
 
-- **Agente** é a identidade persistente: nome humano, cargo, pasta, histórico, status. Sobrevive ao fechamento do Claude.
-- **Sessão** é a execução runtime — tem `session_id`, heartbeat, travas. Quando você fecha o Claude, a sessão morre, mas o agente continua existindo (status `paused` ou `dead`).
-- Ao reabrir, o `/abrir` **retoma o mesmo agente** pela combinação cargo + pasta, em vez de criar `Frontend-02`, `Frontend-03`, etc.
+O gerente pode atribuir descrições que façam sentido para a tarefa atual, por exemplo:
 
-</details>
+- `API de importação e schema`;
+- `UX da pré-visualização`;
+- `investigação de duplicidades`;
+- `revisor da integração`.
 
-<details>
-<summary><b>Cargos</b></summary>
+O papel pode mudar no próximo lote. Ele serve para informar foco e facilitar roteamento; não concede autoridade de gerente. A identidade humana do agente continua persistente entre sessões.
 
-Cargos padrão (em `.claude/roles/*.md` — edite por projeto):
-
-| Cargo | Foco |
+| Conceito | Função |
 |---|---|
-| `gerente` | Coordena equipe, valida decisões estruturais, prioriza fila |
-| `backend` | APIs, banco, integrações server-side |
-| `frontend` | UI, React, estilo, UX |
-| `bugs` | Reproduz, isola, conserta defeitos pontuais |
-| `whatsapp` | Bots Baileys, integrações WhatsApp |
-| `qa` | Revisa work items entregues |
+| Autoridade | Define quem coordena. Há um gerente por escopo; os demais são trabalhadores. |
+| Papel atual | Texto livre atribuído pelo gerente para comunicar o foco do agente. |
+| Agente | Identidade persistente, com nome, histórico, pasta e progresso. |
+| Sessão | Execução atual, com `session_id`, heartbeat e locks. |
+| Work item | Unidade executável com dono, dependências, escopos e aceite. |
 
-</details>
-
-<details>
-<summary><b>Estados do agente</b></summary>
-
-`available` → ainda nunca foi usado · `working` → tem sessão ativa agora · `paused` → fechou sessão limpo, pronto pra retomar · `dead` → sessão morreu sem fechar (3min sem heartbeat) · `archived` → removido da equipe.
-
-</details>
-
-<details>
-<summary><b>Locks e escopos</b></summary>
-
-Locks são **cooperativos** — o MCP não bloqueia o filesystem, depende de cada Claude obedecer `/travar` antes de editar. Aceitam:
-
-- Caminhos literais: `bot/src/routes/leads.ts`
-- Globs: `api/**`, `src/painel/**/*.tsx`, `bot/src/routes/*`
-
-Sobreposições conflitam automaticamente — `api/**` bloqueia `api/src/index.ts` mas não conflita com `painel/**`.
-
-</details>
-
-<details>
-<summary><b>Work items + worktrees</b></summary>
-
-Pra paralelismo de verdade, use a fila estruturada:
-
-1. Gerente cria com `criar_tarefa_estruturada` (dono, escopos, dependências, critério de aceite).
-2. Agente assume com `assumir_tarefa` → o MCP **trava os escopos** e **cria uma worktree git isolada** em `/tmp/agentdesk-worktrees/<branch>`.
-3. Agente trabalha na worktree, na branch `agentdesk/<agente>/<work_item>`.
-4. Agente entrega com `entregar_tarefa` + resumo + validação executada.
-5. QA/gerente aprova ou reprova com `revisar_tarefa`.
-
-</details>
-
-<details>
-<summary><b>Modo autônomo</b></summary>
-
-`/auto` coloca o agente num loop self-paced. Cada tick:
-
-1. `tick_autonomo` → retorna inbox novo, handoffs, estado da tarefa, sugestão (`AGIR` / `AGUARDAR` / `OCIOSO`) e delay (30s/60s/120s/300s).
-2. Age conforme a sugestão (responde alerta, dá um passo na tarefa, escala pro humano).
-3. `marcar_lido` pra não reagir nas mesmas mensagens.
-4. Agenda próximo wakeup com o delay sugerido.
-
-O **watcher** (`scripts/agentdesk-watcher.mjs`) observa o banco e, quando entra mensagem direcionada a um agente em auto com `tmux_pane` registrado, faz `tmux send-keys` na pane dele pra acelerar o próximo tick.
-
-</details>
+O escopo normalmente é a pasta de trabalho/projeto. A eleição do gerente é protegida contra concorrência: duas janelas abertas ao mesmo tempo não devem criar dois gerentes para o mesmo escopo.
 
 ---
 
-## 📖 Comandos
+## 📦 Distribuição de uma lista
 
-> No Claude Code, as tools são chamadas pelo modelo. Você escreve em português (`/abrir como backend...`), e o Claude mapeia pro MCP correto.
+A tool `distribuir_tarefas` recebe o lote completo. Cada entrada pode informar título, descrição, aceite, prioridade, dependências, arquivos ou escopos pretendidos, papel desejado e destinatário explícito.
 
-| Atalho | Tool MCP | O que faz |
-|---|---|---|
-| `/abrir` | `abrir_ou_retornar_agente` | Onboarding: retoma agente compatível ou cria novo |
-| `/agentes` | `listar_agentes` | Lista todos os agentes da equipe |
-| `/retomar <nome>` | `retomar_agente` | Retoma um agente específico |
-| `/inbox` | `inbox_agente` | Pedidos, alertas e handoffs pendentes |
-| `/status` | `listar_status` | Agentes ativos + travas + chat recente |
-| `/falar <msg>` | `enviar_mensagem` | Mensagem geral no chat |
-| `/pedir <quem> <msg>` | `pedir_acao` | Pedido direcionado (por nome OU cargo) |
-| `/passar <quem> <nota>` | `passar_tarefa` | Handoff da tarefa atual |
-| `/travar <arquivos>` | `travar_arquivos` | Lock cooperativo antes de editar |
-| `/atualizar <progresso>` | `atualizar_progresso` | Registra progresso curto |
-| `/feito <resumo>` | `marcar_feito` | Conclui tarefa, libera travas |
-| `/pausar [motivo]` | `pausar_agente` | Pausa o agente (sessão fecha, agente continua) |
-| `/fechar [motivo]` | `fechar_sessao` | Encerra sessão limpa |
-| `/auto` | `entrar_modo_auto` | Liga modo autônomo |
-| `/sair-auto` | `entrar_modo_auto(false)` | Desliga modo autônomo |
-| — | `criar_tarefa_estruturada` | Cria work item completo |
-| — | `assumir_tarefa` | Assume work item, trava escopos, cria worktree |
-| — | `bloquear_tarefa` | Marca work item bloqueado com motivo |
-| — | `entregar_tarefa` | Entrega pra review |
-| — | `revisar_tarefa` | QA aprova ou reprova |
-| — | `listar_contexto_time` | Snapshot completo da equipe |
-| — | `detectar_conflitos` | Confere conflitos sem criar lock |
+Quando o destinatário não é informado, o gerente distribui considerando disponibilidade, carga atual e papel. Os escopos declarados alimentam os locks antes da edição. Dependências continuam na fila até ficarem prontas; itens independentes começam em paralelo.
+
+Exemplo conceitual:
+
+```jsonc
+{
+  "tarefas": [
+    {
+      "chave": "api",
+      "titulo": "Criar endpoint de importação",
+      "aceite": "testes da rota passam",
+      "arquivos_ou_escopos": ["api/**"]
+    },
+    {
+      "chave": "web",
+      "titulo": "Construir pré-visualização",
+      "aceite": "estados vazio, erro e sucesso cobertos",
+      "arquivos_ou_escopos": ["web/src/importacao/**"]
+    },
+    {
+      "titulo": "Validar fluxo integrado",
+      "dependencias": ["api", "web"]
+    }
+  ],
+  "estrategia": "balanceada",
+  "paralelismo": 3
+}
+```
+
+A criação do lote é atômica: uma falha de validação não deve deixar metade da lista cadastrada. A atribuição direta usa a identidade do agente; o papel livre é um sinal de especialização, não uma fila rígida.
 
 ---
 
-## 🎬 Exemplo ao vivo
+## 🪙 Rapidez sem desperdiçar tokens
 
-Dois Claudes trabalhando juntos:
+O desenho favorece paralelismo útil, não conversa constante:
 
-**Janela A — Claude Code modo backend:**
+- uma chamada em lote substitui várias delegações e mensagens repetidas;
+- o tick autônomo retorna deltas compactos, não o histórico completo;
+- cada trabalhador recebe só seu item atual, aceite, escopos e alertas novos;
+- o gerente acompanha resumos de progresso e exceções, não raciocínios completos;
+- locks impedem dois agentes de gastar contexto implementando o mesmo arquivo;
+- espera ociosa usa backoff; mensagens urgentes podem acordar a sessão via watcher/broker;
+- a fila mantém trabalho preparado para o agente continuar sem uma nova rodada de decisão.
+
+Mais agentes só ajudam quando existem itens independentes. Se toda a lista altera o mesmo arquivo ou depende de uma única etapa, o gerente reduz o paralelismo em vez de criar contenção.
+
+---
+
+## 🔧 Tools MCP
+
+Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
+
+### Entrada e equipe
+
+| Atalho/Tool | O que faz |
+|---|---|
+| `/abrir` → `abrir` | Cria ou retoma a identidade, elege gerente ou registra trabalhador e ativa auto. |
+| `listar_agentes` | Mostra identidade, autoridade, papel atual, carga e estado. |
+| `atribuir_papel` | Gerente define ou troca o papel livre de um agente. |
+| `listar_status` | Snapshot operacional da equipe, fila, chat e locks. |
+| `fechar_sessao` / `pausar_agente` | Encerra ou pausa preservando identidade e histórico. |
+
+### Planejamento e execução
+
+| Tool | O que faz |
+|---|---|
+| `distribuir_tarefas` | Valida, cria e atribui uma lista inteira para execução paralela. |
+| `criar_tarefa_estruturada` | Cria um work item individual. |
+| `delegar_tarefa` | Compatibilidade para uma delegação individual. |
+| `assumir_tarefa` | Claim atômico manual; o fluxo auto também pode assumir o próximo item pronto. |
+| `bloquear_tarefa` | Registra impedimento concreto e devolve capacidade à fila. |
+| `entregar_tarefa` | Entrega resumo e validação sem obrigar o trabalhador a ficar parado. |
+| `revisar_tarefa` | Gerente ou outro par da equipe revisa de forma assíncrona; não existe cargo fixo de QA. |
+
+### Coordenação
+
+| Tool | O que faz |
+|---|---|
+| `travar_arquivos` / `liberar_travas` | Locks cooperativos para caminhos e globs. |
+| `detectar_conflitos` | Verifica sobreposição antes do trabalho começar. |
+| `enviar_mensagem` / `pedir_acao` | Comunicação geral ou direcionada. |
+| `passar_tarefa` | Handoff explícito com contexto persistido. |
+| `atualizar_progresso` | Resumo curto para a equipe e o desktop. |
+| `tick_autonomo` / `marcar_lido` | Loop incremental usado internamente pelo modo auto. |
+
+As entradas legadas que informam `cargo` continuam aceitas para compatibilidade, mas o valor é livre. Novas integrações devem preferir `abrir`, `atribuir_papel` e a atribuição por agente.
+
+---
+
+## 🔒 Locks, worktrees e concorrência
+
+Locks são cooperativos: o MCP registra a posse e detecta sobreposição de caminhos ou globs, mas não altera permissões do filesystem. Cada agente deve obter o lock antes de editar.
 
 ```text
-você: /abrir como backend, tarefa "criar endpoint /leads/import",
-      pasta /home/eddch/Projetos/CRMFRImobiliaria,
-      vou mexer em bot/src/routes/leads.ts
+api/**                 conflita com api/src/leads.ts
+web/src/**/*.tsx       conflita com web/src/pages/Importar.tsx
+api/**                 não conflita com web/**
 ```
 
-> O Claude chama `abrir_ou_retornar_agente`. Como não existe agente backend ainda nessa pasta, cria **Jonathan/backend**.
-
-```text
-você: trava o arquivo
-```
-
-> `travar_arquivos(arquivos=["bot/src/routes/leads.ts"], area="bot/leads")`
-
-```text
-você: fala no chat que terminou o endpoint
-```
-
-> `enviar_mensagem(mensagem="endpoint /leads/import pronto, payload {nome, telefone, origem}")`
-
-**Janela B — Claude Code modo QA, em outro terminal:**
-
-```text
-você: /abrir como qa, tarefa "revisar import de leads"
-```
-
-> Cria **Camila/qa**. O snapshot já mostra que Jonathan está editando `bot/src/routes/leads.ts` e mandou recado.
-
-```text
-você: /status
-```
-
-> Vê os dois agentes, a trava e a mensagem do Jonathan em ordem cronológica.
-
-```text
-você: peça pro Jonathan retornar o id criado
-```
-
-> `pedir_acao(destinatario="Jonathan", mensagem="incluir id no retorno do POST /leads/import")`
-
-A próxima vez que a janela A chamar qualquer tool (ou que o watcher cutucar a pane via tmux em modo `/auto`), o pedido aparece no inbox.
+O claim de work item e a aquisição de locks são protegidos contra corrida. Para mudanças realmente paralelas, worktrees isolam branches em `/tmp/agentdesk-worktrees` e reduzem colisões no diretório principal.
 
 ---
 
 ## 🖥️ Desktop opcional
 
-App Electron read-only que monitora a equipe inteira em tempo real:
+O app Electron acompanha a equipe em tempo real:
 
-- **Sidebar** — todos os agentes, status, cargo, última atividade
-- **Header** — tabs por agente com indicador de novidade
-- **Chat** — fluxo de mensagens com filtros (geral / direcionada / alertas / decisões)
-- **LocksPanel** — quem tem o quê travado, conflitos detectados
-- **ActivityPanel** — work items por status, handoffs pendentes
-- **TerminalPane** — terminal embutido por agente, com filtros do log
+- agentes com autoridade, papel atual, estado e atividade;
+- fila de work items, bloqueios, entregas e dependências;
+- chat e mensagens direcionadas;
+- locks ativos e conflitos;
+- terminais embutidos para as sessões que você abrir.
 
 ```bash
 cd desktop
 npm install
-npm run dev    # Vite + Electron em watch
+npm run build
+npm run launcher:install
 ```
+
+Depois, pesquise por **AgentDesk** no launcher do sistema. A abertura diária usa o build pronto diretamente, sem recompilar nem manter um processo `npm`. Para desenvolvimento com hot reload, use `npm run dev`.
+
+O botão de terminal abre um shell local; ainda é necessário iniciar o cliente de agente e chamar `/abrir` nele.
 
 ---
 
@@ -320,74 +313,49 @@ npm run dev    # Vite + Electron em watch
 
 ```mermaid
 graph TB
-    subgraph Layer1["MCP Server · src/"]
-        I[index.ts<br/>stdio bootstrap]
-        T[tools.ts<br/>~70 tools]
-        A[agents.ts<br/>identidades persistentes]
-        L[locks.ts<br/>lock cooperativo + escopos]
-        C[chat.ts<br/>mensagens]
-        W[work-items.ts<br/>fila estruturada]
-        WT[worktree.ts<br/>git worktrees]
-        N[notifier.ts<br/>watcher hook]
-        LF[lifecycle.ts<br/>sweeps + heartbeat]
-    end
-
-    subgraph Layer2["Persistência"]
-        DB[(SQLite WAL<br/>~/.agentdesk/agentdesk.db)]
-    end
-
-    subgraph Layer3["Periféricos"]
-        WCH[scripts/agentdesk-watcher.mjs<br/>tmux send-keys]
-        BRK[scripts/agentdesk-broker.mjs<br/>relay opcional]
-        DSK[desktop/<br/>Electron read-only]
-    end
-
-    I --> T
-    T --> A & L & C & W & WT & N
-    T --> DB
-    LF --> DB
-    WCH -.lê.-> DB
-    BRK -.relay.-> DB
-    DSK -.lê.-> DB
+    C1["Sessão 1 · gerente"] --> MCP["AgentDesk MCP"]
+    C2["Sessão 2 · trabalhador"] --> MCP
+    C3["Sessão 3 · trabalhador"] --> MCP
+    MCP --> DB[("SQLite WAL")]
+    MCP --> WT["Worktrees"]
+    DB --> D["Desktop"]
+    DB --> W["Watcher/Broker opcional"]
+    W -. acorda .-> C1
+    W -. acorda .-> C2
+    W -. acorda .-> C3
 ```
 
-**Tabelas SQLite:** `sessions`, `agents`, `roles`, `tasks`, `work_items`, `locks`, `chat_messages`, `updates`, `handoffs`, `events`.
+O SQLite compartilhado persiste agentes, sessões, work items, dependências, locks, chat, handoffs e eventos. Cada processo MCP usa transações curtas; o modo WAL permite várias sessões locais concorrentes.
+
+---
+
+## ⚠️ Limites conhecidos
+
+- **Não spawna agentes.** O MCP coordena as sessões que você abriu, mas não inicia o cliente nem cria capacidade sozinho. O desktop pode abrir shells por conveniência.
+- **Locks são cooperativos.** Um cliente que ignore o protocolo ainda pode editar um arquivo travado.
+- **Autonomia depende do cliente.** Sem watcher/broker, a reação respeita o próximo wakeup do loop; com eles, mensagens urgentes chegam mais rápido.
+- **Uso local.** Não há autenticação para expor o banco ou o stdio publicamente.
+- **Escala local.** SQLite/WAL serve bem a dezenas de sessões, não a uma frota distribuída de centenas.
+- **Paralelismo tem limite estrutural.** Dependências e escopos compartilhados continuam serializando o trabalho quando necessário.
+
+---
+
+## 🧪 Desenvolvimento
 
 ```bash
-sqlite3 ~/.agentdesk/agentdesk.db
-> .tables
-> SELECT name, role, status FROM agents;
-> SELECT * FROM chat_messages ORDER BY created_at DESC LIMIT 20;
+npm run dev
+npm run build
+node tests/e2e.mjs
+node tests/autonomia.mjs
 ```
 
----
-
-## ⚠️ Limitações conhecidas
-
-- **Lock cooperativo, não filesystem.** Depende de cada Claude obedecer `/travar`. As regras em `CLAUDE.md` reforçam isso.
-- **Heartbeat por chamada de tool.** Se o Claude ficar parado pensando muito tempo, vira `suspect` mesmo trabalhando — na prática qualquer tool reseta.
-- **Sem autenticação.** Banco local, confiando que só você roda Claudes contra ele. Não exponha o stdio pra fora.
-- **Sem migrations.** Mudou schema? Apague o `.db` (ou implemente migrations antes de fase 2).
-- **Concorrência por SQLite/WAL.** Aguenta dezenas de Claudes locais sem stress, não foi feito pra centenas simultâneas.
-
----
-
-## 🛣️ Roadmap
-
-- [ ] Migrations versionadas do schema
-- [ ] Configuração por projeto (`.agentdesk.json` na raiz)
-- [ ] Comando `/relatorio` exportando o dia em markdown
-- [ ] Webhook opcional (Slack/Discord) para alertas críticos
-- [ ] Modo multi-host (broker já existe como esboço em `scripts/agentdesk-broker.mjs`)
-- [ ] Painel TUI (`blessed`) pra terminal puro
+O teste E2E sobe múltiplos processos MCP contra um banco temporário para verificar eleição do gerente, abertura autônoma, distribuição em lote, claim concorrente, locks e retomada de identidade.
 
 ---
 
 ## 🤝 Contribuindo
 
-Issues, PRs e ideias são bem-vindos. Pra mudança grande, abra issue primeiro descrevendo o problema antes de codar.
-
----
+Issues e PRs são bem-vindos. Mudanças no protocolo devem preservar duas propriedades: nenhuma tarefa pode ter dois donos por corrida e nenhum trabalhador deve ficar passivo quando existe outro item independente pronto.
 
 ## 📜 Licença
 
@@ -395,6 +363,6 @@ Issues, PRs e ideias são bem-vindos. Pra mudança grande, abra issue primeiro d
 
 <div align="center">
 
-<sub>Feito pra coordenar várias instâncias do <a href="https://www.anthropic.com/claude-code">Claude Code</a> rodando ao mesmo tempo.</sub>
+<sub>Feito para coordenar agentes locais com menos espera, menos repetição e paralelismo útil.</sub>
 
 </div>

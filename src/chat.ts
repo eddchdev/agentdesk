@@ -18,6 +18,7 @@ export interface ChatRow {
   message: string;
   agent_id: string | null;
   agent_name: string | null;
+  team_key: string;
 }
 
 export interface PostChat {
@@ -31,6 +32,7 @@ export interface PostChat {
   message: string;
   agentId?: string | null;
   agentName?: string | null;
+  teamKey?: string | null;
   // Quando true: insere no chat mas NÃO dispara notify pro broker. Usado em
   // fluxos que já emitem notify por outro caminho (delegar_tarefa) — evita
   // double-poke do mesmo evento.
@@ -40,10 +42,13 @@ export interface PostChat {
 export function postChat(db: Database.Database, p: PostChat): ChatRow {
   const id = newId();
   const ts = now();
+  const sessionTeam = db.prepare("SELECT team_key FROM sessions WHERE id = ?")
+    .get(p.sessionId) as { team_key: string } | undefined;
+  const teamKey = p.teamKey || sessionTeam?.team_key || "default";
   db.prepare(
     `INSERT INTO chat_messages
-     (id, created_at, session_id, session_name, role, type, to_target, task_id, files, message, agent_id, agent_name)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     (id, created_at, session_id, session_name, role, type, to_target, task_id, files, message, agent_id, agent_name, team_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     ts,
@@ -56,18 +61,23 @@ export function postChat(db: Database.Database, p: PostChat): ChatRow {
     p.files && p.files.length ? JSON.stringify(p.files) : null,
     p.message,
     p.agentId ?? null,
-    p.agentName ?? null
+    p.agentName ?? null,
+    teamKey
   );
   // Push real-time pro broker, exceto se silent (delegar_tarefa já emite
   // notify do work_item — segundo notify do chat seria poke duplicado).
   if (!p.silent) {
-    const isManagerAction = (p.role === "gerente") && (p.type === "decisao" || p.type === "pedir");
+    const sender = p.agentId
+      ? (db.prepare("SELECT authority FROM agents WHERE id = ?").get(p.agentId) as { authority: string } | undefined)
+      : undefined;
+    const isManagerAction = sender?.authority === "manager" && (p.type === "decisao" || p.type === "pedir");
     notify({
       kind: "chat",
       type: p.type,
       to: p.to ?? null,
       from_agent_id: p.agentId ?? null,
       from_role: p.role,
+      team_key: teamKey,
       urgent: p.type === "alerta" || p.type === "passar" || isManagerAction,
       message_id: id,
     });
@@ -86,12 +96,13 @@ export function postChat(db: Database.Database, p: PostChat): ChatRow {
     message: p.message,
     agent_id: p.agentId ?? null,
     agent_name: p.agentName ?? null,
+    team_key: teamKey,
   };
 }
 
 export function listChat(
   db: Database.Database,
-  opts: { limit?: number; since?: number; to?: string | null; type?: ChatType } = {}
+  opts: { limit?: number; since?: number; to?: string | null; type?: ChatType; team_key?: string | null } = {}
 ): ChatRow[] {
   const clauses: string[] = [];
   const params: any[] = [];
@@ -107,6 +118,10 @@ export function listChat(
   if (opts.type) {
     clauses.push("type = ?");
     params.push(opts.type);
+  }
+  if (opts.team_key) {
+    clauses.push("team_key = ?");
+    params.push(opts.team_key);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const limit = opts.limit ?? 30;

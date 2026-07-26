@@ -6,11 +6,11 @@
 // Faz isso interceptando o broker via env AGENTDESK_NO_FS_WATCH e
 // AGENTDESK_BROKER_PORT.
 
-import { spawn } from "node:child_process";
 import { WebSocketServer } from "ws";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnMcp } from "./helpers/mcp-process.mjs";
 
 const MCP_BIN = resolve(import.meta.dirname, "../dist/index.js");
 const DB_DIR = mkdtempSync(join(tmpdir(), "agentdesk-broker-"));
@@ -49,7 +49,7 @@ async function run() {
   await new Promise((r) => wss.once("listening", r));
 
   // ─── 2. Spawn MCP server, manda algumas tools ─────────────────────
-  const proc = spawn("node", [MCP_BIN], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const proc = spawnMcp(MCP_BIN, { env });
   proc.stderr.on("data", (d) => process.stderr.write(`[mcp] ${d}`));
 
   let nextId = 1;
@@ -65,6 +65,7 @@ async function run() {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
+        if (!("result" in msg) && !("error" in msg)) continue;
         const p = pending.get(msg.id);
         if (p) { pending.delete(msg.id); p.resolve(msg); }
       } catch {}
@@ -104,7 +105,7 @@ async function run() {
   await call("pedir_acao", { session_id: sess, destinatario: "qa", mensagem: "test pedir" });
 
   // Cria gerente em OUTRO client e delega
-  const proc2 = spawn("node", [MCP_BIN], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const proc2 = spawnMcp(MCP_BIN, { env });
   proc2.stderr.on("data", (d) => process.stderr.write(`[mcp2] ${d}`));
   let buf2 = "";
   let id2 = 1;
@@ -117,7 +118,12 @@ async function run() {
       const line = buf2.slice(0, i).trim();
       buf2 = buf2.slice(i + 1);
       if (!line) continue;
-      try { const m = JSON.parse(line); const p = pending2.get(m.id); if (p) { pending2.delete(m.id); p.resolve(m); } } catch {}
+      try {
+        const m = JSON.parse(line);
+        if (!("result" in m) && !("error" in m)) continue;
+        const p = pending2.get(m.id);
+        if (p) { pending2.delete(m.id); p.resolve(m); }
+      } catch {}
     }
   });
   const rpc2 = (method, params) => new Promise((resolve, reject) => {
@@ -164,9 +170,9 @@ async function run() {
   if (!/ok/.test(heartbeatR)) failures.push("MCP travou após broker cair");
 
   proc.stdin.end();
-  proc.kill("SIGTERM");
+  proc.kill(proc.agentdeskTestPty ? "SIGKILL" : "SIGTERM");
   proc2.stdin.end();
-  proc2.kill("SIGTERM");
+  proc2.kill(proc2.agentdeskTestPty ? "SIGKILL" : "SIGTERM");
   await new Promise((r) => setTimeout(r, 200));
 
   console.log("\n" + "=".repeat(50));

@@ -10,7 +10,9 @@
     "ui:dev": "vite",
     "electron:build": "tsc -p tsconfig.electron.json",
     "build": "npm run electron:build && npm run ui:build",
-    "start": "npm run build && electron .",
+    "start": "electron .",
+    "start:fresh": "npm run build && electron .",
+    "launcher:install": "./scripts/install-launcher.sh",
     "dev": "AGENTDESK_DEV=1 concurrently -k -s first -n VITE,ELEC \"vite\" \"wait-on http://localhost:5173 && npm run electron:build && electron .\"",
     "rebuild": "npx --yes @electron/rebuild@latest -f -w better-sqlite3"
   },

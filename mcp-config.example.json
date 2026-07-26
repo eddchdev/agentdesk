@@ -1,15 +1,16 @@
 {
-  "_comment_pt": "Adicione este bloco ao seu ~/.claude.json ou ~/.config/claude/claude_desktop_config.json dentro de mcpServers. Ajuste o caminho absoluto se necessário.",
+  "_comment_pt": "Copie o bloco mcpServers para o seu ~/.claude.json (ou configuração equivalente) e substitua /CAMINHO/ABSOLUTO/agentdesk.",
+  "_primeiro_uso": "Depois de reiniciar o cliente, use /abrir em cada janela. A primeira vira gerente do escopo; as demais entram disponíveis e em auto.",
   "mcpServers": {
     "agentdesk": {
       "command": "node",
-      "args": ["/home/eddch/Projetos/MCP_AgentDesk/dist/index.js"]
+      "args": ["/CAMINHO/ABSOLUTO/agentdesk/dist/index.js"]
     }
   },
   "_alternativa_dev": {
     "agentdesk": {
       "command": "npx",
-      "args": ["tsx", "/home/eddch/Projetos/MCP_AgentDesk/src/index.ts"]
+      "args": ["tsx", "/CAMINHO/ABSOLUTO/agentdesk/src/index.ts"]
     }
   }
 }

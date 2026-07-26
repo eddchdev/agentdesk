@@ -32,13 +32,13 @@ export function TerminalPane({ id, active, name }: Props) {
         cursor:              "#f54e00",
         cursorAccent:        "#0f0e0b",
         selectionBackground: "rgba(245,78,0,0.18)",
-        // ANSI — mesmas variáveis de role/type do design system
+        // ANSI — paleta pastel do design system
         black:         "#262219",
-        red:           "#cf4060",   // --role-bugs / --dead
-        green:         "#9fc9a2",   // --role-backend (mint)
+        red:           "#cf4060",
+        green:         "#9fc9a2",
         yellow:        "#e3b47e",   // --type-pedir (âmbar)
-        blue:          "#9fbbe0",   // --role-frontend (pastel blue)
-        magenta:       "#c0a8dd",   // --role-gerente (lavanda)
+        blue:          "#9fbbe0",
+        magenta:       "#c0a8dd",
         cyan:          "#6ecfcf",   // --type-falar (teal)
         white:         "#e8e3d5",   // --text
         brightBlack:   "#5c5648",   // --text-muted
@@ -47,7 +47,7 @@ export function TerminalPane({ id, active, name }: Props) {
         brightYellow:  "#c08532",   // --active (ouro)
         brightBlue:    "#9fbbe0",
         brightMagenta: "#a98be0",   // --type-passar (violeta)
-        brightCyan:    "#89dceb",   // --role-whatsapp
+        brightCyan:    "#89dceb",
         brightWhite:   "#f0eee8",
       },
       fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',

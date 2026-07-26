@@ -1,4 +1,5 @@
 import type { SessionView } from "../types";
+import { currentRole, roleBadgeStyle, roleIconStyle, roleTitle } from "../rolePresentation";
 import { AgentIcon } from "./AgentIcon";
 import { Tooltip } from "./Tooltip";
 
@@ -21,11 +22,6 @@ const STATUS_TOOLTIP: Record<SessionView["status"], string> = {
   suspect: "Sem heartbeat há +1 min — pode estar travado",
   dead:    "Sem heartbeat há +3 min — provavelmente inativo",
   closed:  "Sessão encerrada",
-};
-
-const ROLE_PT: Record<string, string> = {
-  gerente: "Gerente", backend: "Backend", frontend: "Frontend",
-  bugs: "Bugs", whatsapp: "WhatsApp", qa: "QA", dono: "Dono",
 };
 
 export function Sidebar({ sessions, selected, onSelect }: Props) {
@@ -51,13 +47,13 @@ export function Sidebar({ sessions, selected, onSelect }: Props) {
               onClick={() => onSelect(selected === s.id ? null : s.id)}
             >
               <div className="session-head">
-                <Tooltip label={ROLE_PT[s.role] ?? s.role} side="right">
-                  <span className={`agent-icon role-${s.role}`}>
+                <Tooltip label={roleTitle(s.role)} side="right">
+                  <span className="agent-icon" style={roleIconStyle(s.role)}>
                     <AgentIcon size={15} />
                   </span>
                 </Tooltip>
                 <span className="session-name">{displayName}</span>
-                <span className={`session-role role-${s.role}`}>{ROLE_PT[s.role] ?? s.role}</span>
+                <span className="session-role" style={roleBadgeStyle(s.role)}>{currentRole(s.role)}</span>
               </div>
               <div className="session-task">{s.task ?? "(sem tarefa)"}</div>
               <div className="session-meta">

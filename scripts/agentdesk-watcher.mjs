@@ -93,6 +93,10 @@ function targetFilter() {
     : "tmux_pane IS NOT NULL AND status NOT IN ('archived','dead')";
 }
 
+function normalizeTeamKey(teamKey) {
+  return typeof teamKey === "string" && teamKey.trim() ? teamKey : "default";
+}
+
 class Poker {
   constructor() {
     this.lastByPane = new Map();
@@ -119,15 +123,16 @@ class Poker {
   }
 }
 
-function resolveTargets(db, to_target) {
+function resolveTargets(db, to_target, teamKey = null) {
   if (!to_target) return [];
+  const scope = normalizeTeamKey(teamKey);
   // Match por nome OU por cargo, dedupe por id.
   const rows = db
     .prepare(
-      `SELECT id, name, role, tmux_pane FROM agents
-       WHERE (name = ? OR role = ?) AND ${targetFilter()}`
+      `SELECT id, name, role, authority, team_key, tmux_pane FROM agents
+       WHERE (name = ? OR role = ?) AND team_key = ? AND ${targetFilter()}`
     )
-    .all(to_target, to_target);
+    .all(to_target, to_target, scope);
   const seen = new Set();
   return rows.filter((r) => {
     if (seen.has(r.id)) return false;
@@ -136,10 +141,38 @@ function resolveTargets(db, to_target) {
   });
 }
 
-function broadcastTargets(db) {
+function broadcastTargets(db, teamKey = null) {
+  const scope = normalizeTeamKey(teamKey);
   return db
-    .prepare(`SELECT id, name, role, tmux_pane FROM agents WHERE ${targetFilter()}`)
-    .all();
+    .prepare(`SELECT id, name, role, authority, team_key, tmux_pane FROM agents
+              WHERE team_key = ? AND ${targetFilter()}`)
+    .all(scope);
+}
+
+function managerTargets(db, teamKey = null) {
+  const scope = normalizeTeamKey(teamKey);
+  return db
+    .prepare(`SELECT id, name, role, authority, team_key, tmux_pane FROM agents
+              WHERE authority = 'manager' AND team_key = ? AND ${targetFilter()}`)
+    .all(scope);
+}
+
+function onePeerReviewer(db, workItem) {
+  const aliasedFilter = targetFilter().replaceAll(/\b(auto_mode|status|tmux_pane)\b/g, "a.$1");
+  const scope = normalizeTeamKey(workItem.team_key);
+  const peer = db.prepare(
+    `SELECT a.id, a.name, a.role, a.authority, a.team_key, a.tmux_pane
+     FROM agents a
+     WHERE a.authority = 'worker' AND a.id <> COALESCE(?, '')
+       AND a.team_key = ? AND ${aliasedFilter}
+     ORDER BY EXISTS(
+       SELECT 1 FROM work_items own WHERE own.owner_agent_id = a.id AND own.status = 'working'
+     ) ASC,
+       CASE WHEN a.id >= ? THEN 0 ELSE 1 END ASC,
+       a.id ASC
+     LIMIT 1`
+  ).get(workItem.owner_agent_id, scope, workItem.id);
+  return peer ? [peer] : managerTargets(db, scope).slice(0, 1);
 }
 
 function main() {
@@ -163,19 +196,25 @@ function main() {
       // ─── 1. Chat messages ──────────────────────────────────────────
       const newMsgs = db
         .prepare(
-          `SELECT id, created_at, agent_id, agent_name, role, type, to_target, message
-           FROM chat_messages WHERE created_at > ? ORDER BY created_at ASC LIMIT 200`
+          `SELECT cm.id, cm.created_at, cm.session_id, cm.agent_id, cm.agent_name, cm.role,
+                  cm.type, cm.to_target, cm.message, cm.team_key,
+                  sender.authority AS sender_authority, sender.team_key AS sender_team_key
+           FROM chat_messages cm
+           LEFT JOIN agents sender ON sender.id = cm.agent_id
+           WHERE cm.created_at > ? ORDER BY cm.created_at ASC LIMIT 200`
         )
         .all(chatCursor);
 
       for (const m of newMsgs) {
         if (m.created_at > chatCursor) chatCursor = m.created_at;
 
-        const isDono = m.role === "dono";
+        const isDono = m.session_id === "desktop-owner" || (!m.agent_id && m.role === "dono");
+        const isManager = m.sender_authority === "manager";
+        const teamKey = normalizeTeamKey(m.sender_team_key ?? m.team_key);
         const isUrgent =
           isDono ||
           m.type === "alerta" ||
-          (m.type === "decisao" && m.role === "gerente") ||
+          (isManager && ["decisao", "pedir", "falar"].includes(m.type)) ||
           (m.type === "passar" && !!m.to_target);
 
         // Tipos que sequer disparam poke.
@@ -183,9 +222,11 @@ function main() {
 
         let targets;
         if (m.to_target) {
-          targets = resolveTargets(db, m.to_target);
-        } else if (isDono || (m.type === "alerta" && m.role === "gerente")) {
-          targets = broadcastTargets(db);
+          targets = resolveTargets(db, m.to_target, teamKey);
+        } else if (isDono || isManager) {
+          targets = broadcastTargets(db, teamKey);
+        } else if (!isManager) {
+          targets = managerTargets(db, teamKey);
         } else {
           continue; // mensagem geral sem destinatário e sem urgência: não acorda ninguém
         }
@@ -208,7 +249,7 @@ function main() {
       const newItems = db
         .prepare(
           `SELECT id, title, status, priority, assigned_to, assigned_role,
-                  owner_agent_id, owner_agent_name, updated_at, created_at
+                  owner_agent_id, owner_agent_name, updated_at, created_at, team_key
            FROM work_items
            WHERE updated_at > ?
            ORDER BY updated_at ASC LIMIT 50`
@@ -221,23 +262,17 @@ function main() {
         // Aciona poke quando o item está esperando alguém pegar/agir:
         //  - queued: alguém precisa assumir
         //  - blocked: dono precisa olhar
-        //  - review: gerente/qa precisa revisar
+        //  - review: um único par livre revisa; gerente é fallback
         // Para items "working" silenciosamente atualizados não pokamos.
         if (!["queued", "blocked", "review"].includes(w.status)) continue;
 
         const urgent = w.priority === "critica" || w.priority === "alta" || w.status === "review";
         let targets = [];
         if (w.status === "review") {
-          // qa e gerente
-          targets = db
-            .prepare(
-              `SELECT id, name, role, tmux_pane FROM agents
-               WHERE role IN ('qa','gerente') AND ${targetFilter()}`
-            )
-            .all();
+          targets = onePeerReviewer(db, w);
         } else {
           const want = w.assigned_to || w.assigned_role || w.owner_agent_name;
-          if (want) targets = resolveTargets(db, want);
+          if (want) targets = resolveTargets(db, want, w.team_key);
         }
 
         const sentPanes = new Set();
@@ -252,7 +287,7 @@ function main() {
       // ─── 3. Handoffs ───────────────────────────────────────────────
       const newHandoffs = db
         .prepare(
-          `SELECT id, from_session, to_target, task_id, created_at
+          `SELECT id, from_session, to_target, task_id, created_at, team_key
            FROM handoffs WHERE created_at > ? AND accepted = 0
            ORDER BY created_at ASC LIMIT 20`
         )
@@ -260,7 +295,7 @@ function main() {
 
       for (const h of newHandoffs) {
         if (h.created_at > handoffCursor) handoffCursor = h.created_at;
-        const targets = resolveTargets(db, h.to_target);
+        const targets = resolveTargets(db, h.to_target, h.team_key);
         const sentPanes = new Set();
         for (const t of targets) {
           if (!t.tmux_pane) continue;

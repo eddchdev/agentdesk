@@ -18,8 +18,10 @@ import {
 import { formatChatLine, listChat, postChat, type ChatType } from "./chat.js";
 import { notify } from "./notifier.js";
 import {
+  claimNextReadyWorkItem,
   claimWorkItem,
   createWorkItem,
+  dependenciesReady,
   getWorkItem,
   listWorkItems,
   parseJsonList,
@@ -28,13 +30,19 @@ import {
 } from "./work-items.js";
 import { prepareWorktree } from "./worktree.js";
 import {
+  assignAgentRole,
+  createOrGetManager,
   createAgent,
+  deriveTeamKey,
+  findManagerForTeam,
   findMatchingAgents,
   findAgentByName,
   findAgentById,
   getAgentByIdentifier,
   getAgentForSession,
+  isManagerAgent,
   listAgents,
+  listAgentsForTeam,
   markAgentSeen,
   pickUniqueName,
   setAgentAutoMode,
@@ -48,7 +56,11 @@ function envTmuxPane(): string | null {
   return process.env.TMUX_PANE || null;
 }
 
-const ROLES = ["gerente", "backend", "frontend", "bugs", "whatsapp", "qa"] as const;
+// Compatibilidade com clientes antigos. O fluxo novo não oferece catálogo de
+// cargos: `gerente` é autoridade e todos os demais papéis são texto livre,
+// atribuído pelo gerente conforme o lote de trabalho.
+const MANAGER_ROLE = "gerente";
+const AVAILABLE_ROLE = "disponivel";
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 
@@ -69,11 +81,187 @@ function getSessionByIdentifier(db: Database.Database, idOrName: string): Sessio
   return row ?? null;
 }
 
-function renderTeamContext(db: Database.Database): string {
+function getManagerForSession(db: Database.Database, session: SessionRow): AgentRow {
+  const agent = getAgentByActiveSession(db, session.id);
+  if (!agent || !isManagerAgent(agent)) {
+    throw new Error("Esta ação exige a autoridade do gerente eleito da equipe.");
+  }
+  return agent;
+}
+
+function teamKeyForSession(session: SessionRow, agent?: AgentRow | null): string {
+  return (session as SessionRow & { team_key?: string }).team_key
+    || agent?.team_key
+    || deriveTeamKey(session.folder, session.project);
+}
+
+function adoptWorkItemRole(
+  db: Database.Database,
+  session: SessionRow,
+  agent: AgentRow,
+  item: WorkItemRow
+) {
+  const role = item.assigned_role?.trim();
+  if (!role || isManagerAgent(agent) || role === agent.role) return;
+  const ts = now();
+  db.prepare(
+    "UPDATE agents SET role = ?, role_assigned_by = COALESCE(role_assigned_by, 'fila-auto'), role_assigned_at = ?, updated_at = ? WHERE id = ?"
+  ).run(role, ts, ts, agent.id);
+  db.prepare("UPDATE sessions SET role = ?, task = ? WHERE id = ?").run(role, item.title, session.id);
+  db.prepare("UPDATE tasks SET title = ?, description = ?, updated_at = ? WHERE id = ?")
+    .run(item.title, item.description ?? item.title, ts, agent.current_task_id);
+  agent.role = role;
+  session.role = role;
+}
+
+function autoClaimNext(
+  db: Database.Database,
+  session: SessionRow,
+  agent: AgentRow
+): WorkItemRow | null {
+  if (isManagerAgent(agent)) return null;
+  const teamKey = teamKeyForSession(session, agent);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let item = db.prepare(
+      `SELECT * FROM work_items
+       WHERE owner_agent_id = ? AND status = 'working' AND team_key = ?
+       ORDER BY updated_at DESC LIMIT 1`
+    ).get(agent.id, teamKey) as WorkItemRow | undefined;
+    const wasAlreadyWorking = !!item;
+    if (!item) {
+      item = claimNextReadyWorkItem(db, {
+        agent_id: agent.id,
+        agent_name: agent.name,
+        agent_role: agent.role,
+        session_id: session.id,
+        team_key: teamKey,
+        folder: session.folder || agent.folder,
+        allow_role_adoption: agent.role === AVAILABLE_ROLE,
+      }) ?? undefined;
+    }
+    if (!item) return null;
+
+    adoptWorkItemRole(db, session, agent, item);
+    const scopes = parseJsonList(item.intended_files);
+    if (scopes.length) {
+      const locks = acquireLocks(
+        db,
+        session.id,
+        scopes,
+        parseJsonList(item.areas)[0],
+        { id: agent.id, name: agent.name }
+      );
+      if (locks.conflicts.length) {
+        releaseLocks(db, session.id, scopes);
+        const reason = `Conflito de lock: ${locks.conflicts
+          .map((conflict) => `${conflict.file} vs ${conflict.held_file} por ${conflict.held_by_name}`)
+          .join("; ")}`;
+        updateWorkItemStatus(db, item.id, "blocked", { blocked_reason: reason });
+        db.prepare(
+          `UPDATE work_items
+           SET owner_agent_id = NULL, owner_agent_name = NULL, owner_session_id = NULL
+           WHERE id = ?`
+        ).run(item.id);
+        recordEvent(db, session.id, "work_item.auto_skipped_lock", { id: item.id, reason });
+        continue;
+      }
+    }
+
+    if (!item.worktree_path) {
+      const folder = item.folder || session.folder || agent.folder;
+      if (folder) {
+        try {
+          const worktree = prepareWorktree({
+            folder,
+            agentName: agent.name,
+            workItemId: item.id,
+            title: item.title,
+          });
+          item = updateWorkItemStatus(db, item.id, "working", {
+            worktree_path: worktree.path,
+            branch_name: worktree.branch,
+          });
+        } catch (error: any) {
+          recordEvent(db, session.id, "work_item.worktree_failed", {
+            id: item.id,
+            error: error?.message ?? String(error),
+          });
+        }
+      }
+    }
+
+    if (!wasAlreadyWorking) {
+      recordEvent(db, session.id, "work_item.auto_claimed", {
+        id: item.id,
+        agent: agent.name,
+        role: item.assigned_role,
+      });
+    }
+    return getWorkItem(db, item.id) ?? item;
+  }
+  return null;
+}
+
+// Escopo padrão das tools de leitura. Com 4 projetos e 30+ agentes no mesmo
+// banco, o painel sem filtro vira lixo: o padrão agora é a equipe do chamador
+// (sessão > pasta explícita > AGENTDESK_FOLDER do Electron > cwd do processo
+// MCP, que o Claude Code inicia na pasta do projeto). todas_equipes=true é o
+// jeito explícito de ver tudo.
+function resolveTeamScope(db: Database.Database, args: any): string | null {
+  if (args?.todas_equipes) return null;
+  if (args?.session_id) {
+    // Leitura pura, sem efeito colateral: descobrir a equipe NÃO é sinal de
+    // vida do alvo. Um painel ou gerente consultando o session_id de um
+    // agente morto não pode ressuscitá-lo (isso mantinha mortos "vivos" para
+    // sempre). Sessão fechada ainda resolve a equipe dela, que é o escopo
+    // mais preciso que existe.
+    const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(args.session_id) as SessionRow | undefined;
+    if (session) {
+      const agente = session.agent_id ? findAgentById(db, session.agent_id) : null;
+      return teamKeyForSession(session, agente);
+    }
+  }
+  const pasta = typeof args?.pasta === "string" && args.pasta.trim() ? args.pasta.trim() : null;
+  const projeto = typeof args?.projeto === "string" && args.projeto.trim() ? args.projeto.trim() : null;
+  // pasta/projeto explícitos ganham do ambiente; sem eles, a equipe é a da
+  // pasta do processo (Claude Code inicia o servidor na pasta do projeto).
+  if (pasta || projeto) return deriveTeamKey(pasta, projeto);
+  return deriveTeamKey(process.env.AGENTDESK_FOLDER || process.cwd(), null);
+}
+
+const ESCOPO_PROPS = {
+  session_id: { type: "string", description: "Escopo preferido: usa a equipe desta sessão (leitura pura, não renova heartbeat)." },
+  pasta: { type: "string", description: "Escopo alternativo: pasta da equipe." },
+  projeto: { type: "string", description: "Escopo alternativo: nome do projeto (equipes project:*)." },
+  todas_equipes: { type: "boolean", default: false, description: "Mostra todas as equipes (visão global explícita)." },
+} as const;
+
+function cabecalhoEscopo(teamKey: string | null): string {
+  return teamKey
+    ? `EQUIPE: ${teamKey}  (use todas_equipes=true para ver todas)`
+    : "EQUIPE: todas";
+}
+
+// O sistema não sabe se um processo morreu; só sabe há quanto tempo não tem
+// notícia dele. "dead"/"suspect" secos afirmavam mais do que o sistema sabe
+// (e mentiam para agente que passa 20min só lendo código). A anotação diz o
+// fato observável.
+function anotaSemNoticias(status: string, lastMs: number): string {
+  if (status !== "dead" && status !== "suspect") return status;
+  const min = Math.max(1, Math.round((now() - lastMs) / 60_000));
+  const idade = min < 60
+    ? `${min}min`
+    : min < 48 * 60
+      ? `${Math.round(min / 60)}h`
+      : `${Math.round(min / (24 * 60))} dias`;
+  return `${status} (sem notícias há ${idade})`;
+}
+
+function renderTeamContext(db: Database.Database, teamKey?: string | null): string {
   sweepSessions(db);
   const sessions = db
-    .prepare("SELECT * FROM sessions WHERE status IN ('active','suspect') ORDER BY opened_at ASC")
-    .all() as SessionRow[];
+    .prepare("SELECT * FROM sessions WHERE status IN ('active','suspect') AND (? IS NULL OR team_key = ?) ORDER BY opened_at ASC")
+    .all(teamKey ?? null, teamKey ?? null) as SessionRow[];
 
   if (!sessions.length) return "Nenhuma sessão ativa no momento.";
 
@@ -83,7 +271,7 @@ function renderTeamContext(db: Database.Database): string {
     const areas = parseJsonList(s.areas).join(", ") || "—";
     const files = parseJsonList(s.intended_files).join(", ") || "—";
     lines.push(
-      `- ${s.name} [${s.role}] status=${status}
+      `- ${s.name} [${s.role}] status=${anotaSemNoticias(status, s.last_heartbeat)}
     tarefa: ${s.task ?? "—"}
     projeto: ${s.project ?? "—"}  pasta: ${s.folder ?? "—"}
     áreas: ${areas}
@@ -93,8 +281,8 @@ function renderTeamContext(db: Database.Database): string {
   return lines.join("\n");
 }
 
-function renderLocks(db: Database.Database): string {
-  const locks = activeLocks(db);
+function renderLocks(db: Database.Database, teamKey?: string | null): string {
+  const locks = activeLocks(db, 100, teamKey);
   if (!locks.length) return "Sem travas ativas.";
   const lines = ["TRAVAS ATIVAS:"];
   for (const l of locks) {
@@ -103,22 +291,23 @@ function renderLocks(db: Database.Database): string {
   return lines.join("\n");
 }
 
-function renderTasks(db: Database.Database): string {
+function renderTasks(db: Database.Database, teamKey?: string | null): string {
   const rows = db
     .prepare(
       `SELECT t.*, s.name as session_name FROM tasks t
        JOIN sessions s ON s.id = t.session_id
-       WHERE t.status IN ('in_progress','pending') ORDER BY t.updated_at DESC LIMIT 20`
+       WHERE t.status IN ('in_progress','pending') AND (? IS NULL OR s.team_key = ?)
+       ORDER BY t.updated_at DESC LIMIT 20`
     )
-    .all() as Array<{ id: string; title: string; status: string; session_name: string }>;
+    .all(teamKey ?? null, teamKey ?? null) as Array<{ id: string; title: string; status: string; session_name: string }>;
   if (!rows.length) return "Sem tarefas em aberto.";
   const lines = ["TAREFAS EM ABERTO:"];
   for (const t of rows) lines.push(`- [${t.status}] ${t.session_name}: ${t.title}`);
   return lines.join("\n");
 }
 
-function renderWorkItems(db: Database.Database): string {
-  const rows = listWorkItems(db, { limit: 12 }).filter((w) => !["done", "canceled"].includes(w.status));
+function renderWorkItems(db: Database.Database, teamKey?: string | null): string {
+  const rows = listWorkItems(db, { limit: 12, team_key: teamKey }).filter((w) => !["done", "canceled"].includes(w.status));
   if (!rows.length) return "Sem work items estruturados abertos.";
   const lines = ["WORK ITEMS ESTRUTURADOS:"];
   for (const w of rows) {
@@ -150,16 +339,16 @@ function formatWorkItem(w: WorkItemRow): string {
   ].filter(Boolean).join("\n");
 }
 
-function renderRecentChat(db: Database.Database, limit = 10): string {
-  const rows = listChat(db, { limit });
+function renderRecentChat(db: Database.Database, limit = 10, teamKey?: string | null): string {
+  const rows = listChat(db, { limit, team_key: teamKey });
   if (!rows.length) return "Chat vazio.";
   const lines = ["ÚLTIMAS MENSAGENS:"];
   for (const r of rows.reverse()) lines.push(formatChatLine(r));
   return lines.join("\n");
 }
 
-function renderAgents(db: Database.Database): string {
-  const agents = listAgents(db);
+function renderAgents(db: Database.Database, teamKey?: string | null): string {
+  const agents = teamKey ? listAgentsForTeam(db, teamKey) : listAgents(db);
   if (!agents.length) return "Nenhum agente registrado.";
   const lines = ["AGENTES:"];
   for (const a of agents) {
@@ -169,7 +358,7 @@ function renderAgents(db: Database.Database): string {
           | undefined)
       : null;
     const sess = session ? `sessão=${session.name} (${session.status})` : "sessão=—";
-    lines.push(`- ${a.name} [${a.role}] status=${a.status}  ${sess}`);
+    lines.push(`- ${a.name} [${a.role}] autoridade=${a.authority} status=${anotaSemNoticias(a.status, a.last_heartbeat)}  ${sess}`);
     if (a.folder) lines.push(`    pasta: ${a.folder}`);
   }
   return lines.join("\n");
@@ -183,6 +372,7 @@ interface OpenSessionInput {
   areas?: string[];
   arquivos_pretendidos?: string[];
   agent?: AgentRow | null;
+  teamKey?: string;
 }
 
 function openSession(db: Database.Database, p: OpenSessionInput): { sessionId: string; sessionName: string; taskId: string; ts: number } {
@@ -190,73 +380,117 @@ function openSession(db: Database.Database, p: OpenSessionInput): { sessionId: s
   const ts = now();
   const sessionStmt = db.prepare(
     `INSERT INTO sessions
-     (id, name, role, task, project, folder, areas, intended_files, opened_at, last_heartbeat, status, agent_id, agent_name)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+     (id, name, role, task, project, folder, areas, intended_files, opened_at, last_heartbeat, status, agent_id, agent_name, team_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`
   );
 
   // Race-safe: nome único pra sessão. Se outro processo inseriu mesmo nome
   // entre o pickSessionName e o INSERT, retry com próximo número.
   let name = pickSessionName(db, p.cargo);
-  let attempts = 0;
-  while (true) {
-    try {
-      sessionStmt.run(
-        id,
-        name,
-        p.cargo,
-        p.tarefa,
-        p.projeto ?? "",
-        p.pasta ?? "",
-        JSON.stringify(p.areas ?? []),
-        JSON.stringify(p.arquivos_pretendidos ?? []),
-        ts,
-        ts,
-        p.agent?.id ?? null,
-        p.agent?.name ?? null
-      );
-      break;
-    } catch (e: any) {
-      if (!/UNIQUE.*sessions\.name/i.test(e?.message ?? "") || attempts++ >= 10) throw e;
-      // Tenta um nome novo (incrementa ou adiciona sufixo random no final).
-      name = pickSessionName(db, p.cargo);
-    }
-  }
   const taskId = newId();
-  db.prepare(
-    `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
-  ).run(taskId, id, p.tarefa, p.tarefa, ts, ts);
+  const tx = db.transaction(() => {
+    let attempts = 0;
+    while (true) {
+      try {
+        sessionStmt.run(
+          id,
+          name,
+          p.cargo,
+          p.tarefa,
+          p.projeto ?? "",
+          p.pasta ?? "",
+          JSON.stringify(p.areas ?? []),
+          JSON.stringify(p.arquivos_pretendidos ?? []),
+          ts,
+          ts,
+          p.agent?.id ?? null,
+          p.agent?.name ?? null,
+          p.teamKey ?? p.agent?.team_key ?? deriveTeamKey(p.pasta, p.projeto)
+        );
+        break;
+      } catch (e: any) {
+        if (!/UNIQUE.*sessions\.name/i.test(e?.message ?? "") || attempts++ >= 10) throw e;
+        name = pickSessionName(db, p.cargo);
+      }
+    }
+    db.prepare(
+      `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
+    ).run(taskId, id, p.tarefa, p.tarefa, ts, ts);
 
-  if (p.agent) {
-    setAgentStatus(db, p.agent.id, "working", { current_session_id: id, current_task_id: taskId });
-    touchAgent(db, p.agent.id);
-  }
+    if (p.agent) {
+      const reserved = db.prepare(
+        `UPDATE agents
+         SET status = 'working', current_session_id = ?, current_task_id = ?, updated_at = ?, last_heartbeat = ?
+         WHERE id = ? AND (status != 'working' OR current_session_id IS NULL)`
+      ).run(id, taskId, ts, ts, p.agent.id);
+      if (reserved.changes !== 1) {
+        throw new Error(`Agente ${p.agent.name} já foi aberto por outra sessão.`);
+      }
+      touchAgent(db, p.agent.id);
+    }
+  });
+  tx.immediate();
   return { sessionId: id, sessionName: name, taskId, ts };
 }
 
-// Ressuscita uma sessão dead (sem fechar e reabrir). Só cria task nova se a tarefa mudou.
+// Ressuscita uma sessão dead (sem fechar e reabrir). Tudo numa transação
+// IMMEDIATE com guardas: sem elas, duas janelas retomavam a MESMA sessão ao
+// mesmo tempo, e uma janela podia sequestrar um agente que já trabalhava em
+// outra sessão viva (current_session_id repontado por baixo da janela dona).
 function reopenSession(
   db: Database.Database,
   sessionId: string,
   newTask: string,
   agent: AgentRow
 ): { sessionId: string; sessionName: string; taskId: string; ts: number } {
-  const ts = now();
-  const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as any;
-  db.prepare(
-    "UPDATE sessions SET last_heartbeat = ?, status = 'active', task = ? WHERE id = ?"
-  ).run(ts, newTask, sessionId);
+  const tx = db.transaction(() => {
+    const ts = now();
+    const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as SessionRow | undefined;
+    if (!session || session.closed_at || session.status === "closed") {
+      throw new Error(`Sessão ${sessionId} não está mais disponível para retomada.`);
+    }
+    const st = deriveStatus(session);
+    if (st === "active" || st === "suspect") {
+      throw new Error(`Sessão ${session.name} já está ativa (outra janela retomou primeiro).`);
+    }
+    const atual = findAgentById(db, agent.id);
+    if (atual?.current_session_id && atual.current_session_id !== sessionId) {
+      const outra = db.prepare("SELECT * FROM sessions WHERE id = ?").get(atual.current_session_id) as SessionRow | undefined;
+      if (outra && ["active", "suspect"].includes(deriveStatus(outra))) {
+        throw new Error(
+          `Agente ${agent.name} já está ativo em outra sessão (${outra.name}). Use aquela sessão ou feche-a antes.`
+        );
+      }
+    }
 
-  const taskId = newId();
-  db.prepare(
-    `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
-  ).run(taskId, sessionId, newTask, newTask, ts, ts);
+    db.prepare(
+      "UPDATE sessions SET last_heartbeat = ?, status = 'active', task = ? WHERE id = ?"
+    ).run(ts, newTask, sessionId);
 
-  setAgentStatus(db, agent.id, "working", { current_session_id: sessionId, current_task_id: taskId });
-  touchAgent(db, agent.id);
+    // Reaproveita a task in_progress de mesmo título: cada restart criava uma
+    // nova e, depois de alguns ciclos, marcar_feito falhava por ambiguidade.
+    const existente = db.prepare(
+      "SELECT id FROM tasks WHERE session_id = ? AND status = 'in_progress' AND title = ? ORDER BY created_at DESC LIMIT 1"
+    ).get(sessionId, newTask) as { id: string } | undefined;
+    let taskId: string;
+    if (existente) {
+      taskId = existente.id;
+      db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(ts, taskId);
+    } else {
+      taskId = newId();
+      db.prepare(
+        `INSERT INTO tasks (id, session_id, title, description, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'in_progress', ?, ?)`
+      ).run(taskId, sessionId, newTask, newTask, ts, ts);
+    }
 
-  return { sessionId, sessionName: session.name, taskId, ts };
+    setAgentStatus(db, agent.id, "working", { current_session_id: sessionId, current_task_id: taskId });
+    touchAgent(db, agent.id);
+
+    return { sessionId, sessionName: session.name, taskId, ts };
+  });
+  return tx.immediate() as { sessionId: string; sessionName: string; taskId: string; ts: number };
 }
 
 function getAgentByActiveSession(db: Database.Database, sessionId: string): AgentRow | null {
@@ -264,29 +498,33 @@ function getAgentByActiveSession(db: Database.Database, sessionId: string): Agen
 }
 
 function renderInbox(db: Database.Database, agent: AgentRow, since: number): string {
-  // Mensagens para este agente (por nome ou por cargo) + handoffs pendentes desde 'since'.
+  // Mensagens para este agente (por nome ou papel atual) + handoffs pendentes.
   const msgs = db
     .prepare(
-      `SELECT * FROM chat_messages
-       WHERE created_at > ?
+      `SELECT cm.* FROM chat_messages cm
+       WHERE cm.team_key = ? AND created_at > ?
          AND (
            to_target = ? OR to_target = ?
-           OR (role = 'gerente' AND (type = 'alerta' OR to_target IS NULL))
-           OR role = 'dono'
+           OR (
+             EXISTS (SELECT 1 FROM agents sender WHERE sender.id = cm.agent_id AND sender.authority = 'manager')
+             AND (type = 'alerta' OR to_target IS NULL)
+           )
+           OR cm.role = 'dono' OR cm.session_id = 'desktop-owner'
+           OR (? = 1 AND to_target IS NULL)
          )
        ORDER BY created_at ASC LIMIT 50`
     )
-    .all(since, agent.name, agent.role) as any[];
+    .all(agent.team_key, since, agent.name, agent.role, isManagerAgent(agent) ? 1 : 0) as any[];
 
   const handoffs = db
     .prepare(
       `SELECT h.*, s.name as from_name FROM handoffs h
        LEFT JOIN sessions s ON s.id = h.from_session
-       WHERE h.accepted = 0
+       WHERE h.team_key = ? AND h.accepted = 0
          AND (h.to_target = ? OR h.to_target = ?)
        ORDER BY h.created_at ASC LIMIT 20`
     )
-    .all(agent.name, agent.role) as any[];
+    .all(agent.team_key, agent.name, agent.role) as any[];
 
   const lines: string[] = [];
   lines.push(`INBOX de ${agent.name} [${agent.role}] (desde ${new Date(since).toISOString().replace("T", " ").slice(0, 19)}):`);
@@ -308,17 +546,52 @@ function renderInbox(db: Database.Database, agent: AgentRow, since: number): str
   return lines.join("\n");
 }
 
+// Entrada única: o abrir devolve numa resposta só o que o agente antes
+// precisava buscar em listar_status + listar_chat + inbox_agente (com 9
+// agentes numa frente, cada chamada extra de entrada custa caro) e já trava
+// os arquivos declarados.
+function renderContextoEntrada(
+  db: Database.Database,
+  teamKey: string,
+  agent: AgentRow,
+  sessionId: string,
+  arquivos: string[],
+  areas: string[]
+): string {
+  const lines: string[] = [];
+  if (arquivos.length) {
+    const r = acquireLocks(db, sessionId, arquivos, areas[0], { id: agent.id, name: agent.name });
+    if (r.granted.length) {
+      lines.push(`travas concedidas na entrada: ${r.granted.map((g) => g.file).join(", ")}`);
+    }
+    for (const c of r.conflicts) {
+      lines.push(`trava recusada: ${c.file} já está com ${c.held_by_name} [${c.held_by_role}] — NÃO edite antes de travar`);
+    }
+  }
+  lines.push("");
+  lines.push(renderInbox(db, agent, agent.last_seen_ms || agent.created_at));
+  lines.push("");
+  lines.push(renderTeamContext(db, teamKey));
+  lines.push("");
+  lines.push(renderWorkItems(db, teamKey));
+  lines.push("");
+  lines.push(renderLocks(db, teamKey));
+  lines.push("");
+  lines.push(renderRecentChat(db, 8, teamKey));
+  return lines.join("\n");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const tools: ToolDef[] = [
   {
     name: "abrir_sessao",
     description:
-      "Abre uma nova sessão da equipe AgentDesk. Use no início de toda sessão do Claude Code, antes de qualquer coisa. Recebe cargo, tarefa, projeto, pasta e áreas/arquivos pretendidos. Retorna o session_id e o contexto da equipe.",
+      "Compatibilidade: abre sessão informando papel e tarefa manualmente. Novos clientes devem usar abrir. Se já existir sessão viva com o mesmo cargo e tarefa na mesma equipe, recusa (force_new=true cria mesmo assim); se existir sessão morta, retoma em vez de duplicar.",
     inputSchema: {
       type: "object",
       properties: {
-        cargo: { type: "string", enum: [...ROLES], description: "Cargo desta sessão." },
+        cargo: { type: "string", description: "Papel desta sessão (legado; no fluxo novo o gerente atribui)." },
         tarefa: { type: "string", description: "Tarefa principal desta sessão." },
         projeto: { type: "string", description: "Nome do projeto." },
         pasta: { type: "string", description: "Pasta de trabalho atual (absoluta)." },
@@ -332,43 +605,122 @@ export const tools: ToolDef[] = [
           items: { type: "string" },
           description: "Lista de arquivos que pretende editar (paths).",
         },
+        force_new: {
+          type: "boolean",
+          default: false,
+          description: "Cria um segundo agente mesmo já havendo sessão viva com o mesmo cargo e tarefa.",
+        },
       },
       required: ["cargo", "tarefa"],
     },
     handler: (args) => {
       const schema = z.object({
-        cargo: z.enum(ROLES as any),
+        cargo: z.string().min(1),
         tarefa: z.string().min(1),
         projeto: z.string().optional().default(""),
         pasta: z.string().optional().default(""),
         areas: z.array(z.string()).optional().default([]),
         arquivos_pretendidos: z.array(z.string()).optional().default([]),
+        force_new: z.boolean().optional().default(false),
       });
       const p = schema.parse(args);
       const db = getDb();
       sweepSessions(db);
 
-      // Legacy: cria sempre agente novo (sem retomada). Pra retomada use abrir_ou_retornar_agente.
-      const agentName = pickUniqueName(db);
-      const agent = createAgent(db, {
-        name: agentName,
-        role: p.cargo,
-        project: p.projeto,
-        folder: p.pasta,
-        tmux_pane: envTmuxPane(),
-      });
+      // Sem pasta explícita, herda do ambiente. Sem isso, sessões de projetos
+      // diferentes caíam todas na equipe 'default' e o chat vinha misturado.
+      const pastaEfetiva = p.pasta || process.env.AGENTDESK_FOLDER || process.cwd();
 
-      const { sessionId, sessionName, taskId } = openSession(db, {
-        cargo: p.cargo,
-        tarefa: p.tarefa,
-        projeto: p.projeto,
-        pasta: p.pasta,
-        areas: p.areas,
-        arquivos_pretendidos: p.arquivos_pretendidos,
-        agent,
-      });
+      // Proteção contra duplicata: na operação real, o retry do cliente após
+      // um falso-morto criava dois agentes com o mesmo cargo e a mesma tarefa
+      // ("um morto e um trabalhando"). Sessão viva igual recusa; morta retoma.
+      // Decisão E criação na MESMA transação IMMEDIATE: sem isso, duas janelas
+      // simultâneas passavam ambas pelo SELECT antes de qualquer INSERT e a
+      // duplicata voltava pela porta da corrida.
+      const dedupTeamKey = deriveTeamKey(pastaEfetiva, p.projeto);
+      type Abertura =
+        | { tipo: "retomada"; dono: AgentRow; reaberta: { sessionId: string; sessionName: string; taskId: string; ts: number } }
+        | { tipo: "nova"; agent: AgentRow; opened: { sessionId: string; sessionName: string; taskId: string; ts: number } };
+      const abertura = db.transaction((): Abertura => {
+        if (!p.force_new) {
+          const iguais = db.prepare(
+            `SELECT * FROM sessions
+             WHERE team_key = ? AND role = ? AND task = ? AND status != 'closed' AND closed_at IS NULL
+             ORDER BY last_heartbeat DESC`
+          ).all(dedupTeamKey, p.cargo, p.tarefa) as SessionRow[];
+          for (const existente of iguais) {
+            const st = deriveStatus(existente);
+            if (st === "active" || st === "suspect") {
+              const quem = existente.agent_name || existente.name;
+              throw new Error(
+                `Já existe ${quem} trabalhando nesta mesma tarefa (sessão ${existente.name}, ` +
+                  `session_id=${existente.id}, status=${st}). Para continuar aquele trabalho, ` +
+                  `use abrir com retomar_agente_id; para criar mesmo assim um segundo agente, ` +
+                  `re-chame com force_new=true.`
+              );
+            }
+            if (st === "dead" && existente.agent_id) {
+              const dono = findAgentById(db, existente.agent_id);
+              if (dono && dono.status !== "archived") {
+                return { tipo: "retomada", dono, reaberta: reopenSession(db, existente.id, p.tarefa, dono) };
+              }
+            }
+          }
+        }
+        // Legacy: cria agente novo. Pra retomada por nome use abrir_ou_retornar_agente.
+        const novoAgente = createAgent(db, {
+          name: pickUniqueName(db),
+          role: p.cargo,
+          project: p.projeto,
+          folder: pastaEfetiva,
+          tmux_pane: envTmuxPane(),
+        });
+        const opened = openSession(db, {
+          cargo: p.cargo,
+          tarefa: p.tarefa,
+          projeto: p.projeto,
+          pasta: pastaEfetiva,
+          areas: p.areas,
+          arquivos_pretendidos: p.arquivos_pretendidos,
+          agent: novoAgente,
+        });
+        return { tipo: "nova", agent: novoAgente, opened };
+      }).immediate() as Abertura;
 
-      recordEvent(db, sessionId, "session.opened", { name: sessionName, role: p.cargo, task: p.tarefa, agent: agentName });
+      if (abertura.tipo === "retomada") {
+        const { dono, reaberta } = abertura;
+        recordEvent(db, reaberta.sessionId, "session.reopened_dedup", {
+          agent_id: dono.id,
+          role: p.cargo,
+          task: p.tarefa,
+        });
+        postChat(db, {
+          sessionId: reaberta.sessionId,
+          sessionName: reaberta.sessionName,
+          role: p.cargo,
+          type: "falar",
+          agentId: dono.id,
+          agentName: dono.name,
+          message: `Voltei. Retomando a mesma tarefa: ${p.tarefa}.`,
+        });
+        return text(
+          [
+            `Sessão retomada (não duplicada): ${reaberta.sessionName} (id=${reaberta.sessionId})`,
+            `Agente: ${dono.name} [id=${dono.id}]`,
+            `Papel: ${p.cargo}`,
+            `Tarefa: ${p.tarefa}`,
+            `Tarefa principal (task_id): ${reaberta.taskId}`,
+            "",
+            "Havia uma sessão sem notícias com este mesmo cargo e tarefa; ela foi reaproveitada.",
+            "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
+          ].join("\n")
+        );
+      }
+
+      const { agent, opened } = abertura;
+      const { sessionId, sessionName, taskId } = opened;
+
+      recordEvent(db, sessionId, "session.opened", { name: sessionName, role: p.cargo, task: p.tarefa, agent: agent.name });
       postChat(db, {
         sessionId,
         sessionName,
@@ -387,9 +739,9 @@ export const tools: ToolDef[] = [
         [
           `Sessão aberta: ${sessionName} (id=${sessionId})`,
           `Agente: ${agent.name} [id=${agent.id}]`,
-          `Cargo: ${p.cargo}`,
+          `Papel: ${p.cargo}`,
           `Tarefa: ${p.tarefa}`,
-          `Pasta: ${p.pasta || "—"}`,
+          `Pasta: ${pastaEfetiva}`,
           `Tarefa principal (task_id): ${taskId}`,
           "",
           "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
@@ -408,36 +760,29 @@ export const tools: ToolDef[] = [
   {
     name: "listar_status",
     description:
-      "Mostra a equipe ativa, status (active/suspect/dead), travas de arquivo, tarefas em aberto e últimas mensagens. Use sempre antes de começar a trabalhar e periodicamente.",
+      "Mostra a equipe ativa, status (active/suspect/dead), travas de arquivo, tarefas em aberto e últimas mensagens. Filtra pela equipe do chamador por padrão; todas_equipes=true mostra tudo.",
     inputSchema: {
       type: "object",
-      properties: {
-        session_id: { type: "string", description: "Opcional — atualiza heartbeat se informado." },
-      },
+      properties: { ...ESCOPO_PROPS },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      if (args?.session_id) {
-        try {
-          requireActiveSession(db, args.session_id);
-          db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), args.session_id);
-        } catch {
-          /* ignore */
-        }
-      }
+      const teamKey = resolveTeamScope(db, args);
       const out = [
-        renderAgents(db),
+        cabecalhoEscopo(teamKey),
         "",
-        renderTeamContext(db),
+        renderAgents(db, teamKey),
         "",
-        renderWorkItems(db),
+        renderTeamContext(db, teamKey),
         "",
-        renderLocks(db),
+        renderWorkItems(db, teamKey),
         "",
-        renderTasks(db),
+        renderLocks(db, teamKey),
         "",
-        renderRecentChat(db, 12),
+        renderTasks(db, teamKey),
+        "",
+        renderRecentChat(db, 12, teamKey),
       ].join("\n");
       return text(out);
     },
@@ -480,14 +825,14 @@ export const tools: ToolDef[] = [
   {
     name: "pedir_acao",
     description:
-      "Pede uma ação a outro Claude ou a um cargo (mensagem tipo 'pedir'). Informe o destinatário (nome da sessão ou cargo) e a mensagem.",
+      "Pede uma ação a outro agente ou a quem estiver num papel atual específico.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string" },
         destinatario: {
           type: "string",
-          description: "Nome da sessão (ex: AgentDesk-Backend-01) ou cargo (ex: backend).",
+          description: "Nome do agente/sessão ou papel atual livre.",
         },
         mensagem: { type: "string" },
         arquivos: { type: "array", items: { type: "string" } },
@@ -519,13 +864,13 @@ export const tools: ToolDef[] = [
   {
     name: "passar_tarefa",
     description:
-      "Passa (handoff) uma tarefa para outro Claude ou cargo. Registra a transferência e libera as travas da tarefa.",
+      "Passa (handoff) uma tarefa para outro agente ou papel atual. Registra a transferência e libera as travas.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string" },
         task_id: { type: "string", description: "ID da tarefa a passar (opcional: usa a principal se omitido)." },
-        destinatario: { type: "string", description: "Nome da sessão ou cargo de destino." },
+        destinatario: { type: "string", description: "Nome do agente/sessão ou papel atual de destino." },
         nota: { type: "string", description: "Contexto curto para quem vai assumir." },
         liberar_travas: { type: "boolean", default: true },
       },
@@ -558,14 +903,45 @@ export const tools: ToolDef[] = [
 
       if (!taskId) throw new Error("Nenhuma tarefa em andamento para passar.");
 
+      // Handoff com contexto: quem recebe precisa saber o que já foi decidido
+      // e tentado, não só a nota. Sem isso o destinatário recebia o título e
+      // recomeçava do zero, repetindo caminhos que já falharam.
+      const tarefaPassada = db.prepare("SELECT title FROM tasks WHERE id = ?").get(taskId) as
+        | { title: string }
+        | undefined;
+      const historico = db.prepare(
+        `SELECT progress, created_at FROM updates
+         WHERE session_id = ? OR task_id = ?
+         ORDER BY created_at DESC LIMIT 5`
+      ).all(s.id, taskId) as Array<{ progress: string; created_at: number }>;
+      // Limites duros: um trabalhador verboso não pode explodir o inbox de
+      // quem recebe (a nota inteira é impressa no inbox e no tick detalhado).
+      const resumir = (texto: string, max: number) =>
+        texto.length > max ? `${texto.slice(0, max - 1)}…` : texto;
+      let notaCompleta = [
+        args.nota,
+        tarefaPassada ? `Tarefa: ${tarefaPassada.title}` : null,
+        ...(historico.length
+          ? [
+              "O que já foi feito/decidido (mais recente primeiro):",
+              ...historico.map((u) => {
+                const quando = new Date(u.created_at).toISOString().replace("T", " ").slice(0, 16);
+                return `  - [${quando}] ${resumir(u.progress, 300)}`;
+              }),
+            ]
+          : []),
+      ].filter(Boolean).join("\n");
+      notaCompleta = resumir(notaCompleta, 4000);
+
       const ts = now();
       const hid = newId();
       db.prepare(
-        "INSERT INTO handoffs (id, from_session, to_target, task_id, note, created_at, accepted) VALUES (?, ?, ?, ?, ?, ?, 0)"
-      ).run(hid, s.id, args.destinatario, taskId, args.nota, ts);
+        "INSERT INTO handoffs (id, from_session, to_target, task_id, note, created_at, accepted, team_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+      ).run(hid, s.id, args.destinatario, taskId, notaCompleta, ts, teamKeyForSession(s, ag));
       notify({
         kind: "handoff",
         to: args.destinatario,
+        team_key: teamKeyForSession(s, ag),
         from_agent_id: ag?.id ?? null,
         urgent: true,
       });
@@ -585,7 +961,7 @@ export const tools: ToolDef[] = [
         type: "passar",
         to: args.destinatario,
         taskId,
-        message: `Passando tarefa: ${args.nota}`,
+        message: `Passando tarefa${tarefaPassada ? ` "${tarefaPassada.title}"` : ""}: ${args.nota}`,
         agentId: ag?.id ?? null,
         agentName: ag?.name ?? null,
       });
@@ -655,7 +1031,7 @@ export const tools: ToolDef[] = [
   {
     name: "liberar_trava",
     description:
-      "Libera travas. Sem 'arquivos', libera todas as suas. Com 'forcar=true' e cargo gerente, força liberação de qualquer trava.",
+      "Libera travas. Sem 'arquivos', libera todas as suas. Com 'forcar=true', somente a autoridade do gerente força outra trava.",
     inputSchema: {
       type: "object",
       properties: {
@@ -669,7 +1045,8 @@ export const tools: ToolDef[] = [
       const db = getDb();
       const s = requireActiveSession(db, args.session_id);
       db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), s.id);
-      const r = releaseLocks(db, s.id, args.arquivos, args.forcar, s.role);
+      const caller = getAgentByActiveSession(db, s.id);
+      const r = releaseLocks(db, s.id, args.arquivos, args.forcar, isManagerAgent(caller) ? MANAGER_ROLE : s.role);
       recordEvent(db, s.id, "locks.release", { files: r.released, forced: !!args.forcar });
       return text(`Liberadas ${r.released.length} travas:\n${r.released.map((f) => `  - ${f}`).join("\n") || "  (nenhuma)"}`);
     },
@@ -863,74 +1240,71 @@ export const tools: ToolDef[] = [
   {
     name: "listar_chat",
     description:
-      "Lista mensagens recentes do chat da equipe. Pode filtrar por destinatário, tipo, e quantidade.",
+      "Lista mensagens recentes do chat da equipe do chamador (todas_equipes=true para o chat global). Pode filtrar por destinatário, tipo, e quantidade.",
     inputSchema: {
       type: "object",
       properties: {
         limite: { type: "number", default: 30 },
-        para: { type: "string", description: "Filtra por destinatário (nome de sessão ou cargo)." },
+        para: { type: "string", description: "Filtra por destinatário (nome ou papel atual)." },
         tipo: { type: "string", enum: ["falar", "pedir", "passar", "alerta", "decisao", "erro"] },
         desde_ts: { type: "number", description: "timestamp ms para filtrar mensagens posteriores." },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
+      const teamKey = resolveTeamScope(db, args);
       const rows = listChat(db, {
         limit: args?.limite ?? 30,
         to: args?.para ?? null,
         type: args?.tipo as ChatType | undefined,
         since: args?.desde_ts,
+        team_key: teamKey,
       });
-      if (!rows.length) return text("Sem mensagens.");
-      return text(rows.reverse().map(formatChatLine).join("\n"));
+      if (!rows.length) return text(`Sem mensagens. ${cabecalhoEscopo(teamKey)}`);
+      return text([cabecalhoEscopo(teamKey), ...rows.reverse().map(formatChatLine)].join("\n"));
     },
   },
 
   {
     name: "listar_contexto_time",
     description:
-      "Retorna o snapshot completo do contexto da equipe: sessões ativas, tarefas, travas, últimas decisões e progresso. Use antes de começar trabalho novo.",
+      "Retorna o snapshot completo do contexto da equipe do chamador: sessões ativas, tarefas, travas, últimas decisões e progresso. todas_equipes=true para a visão global.",
     inputSchema: {
       type: "object",
-      properties: {
-        session_id: { type: "string", description: "Opcional — atualiza heartbeat." },
-      },
+      properties: { ...ESCOPO_PROPS },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      if (args?.session_id) {
-        try {
-          requireActiveSession(db, args.session_id);
-          db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), args.session_id);
-        } catch {
-          /* ignore */
-        }
-      }
+      const teamKey = resolveTeamScope(db, args);
 
       const recentDecisions = db
         .prepare(
-          "SELECT * FROM chat_messages WHERE type IN ('decisao','alerta') ORDER BY created_at DESC LIMIT 10"
+          "SELECT * FROM chat_messages WHERE type IN ('decisao','alerta') AND (? IS NULL OR team_key = ?) ORDER BY created_at DESC LIMIT 10"
         )
-        .all() as any[];
+        .all(teamKey, teamKey) as any[];
       const lastUpdates = db
         .prepare(
           `SELECT u.*, s.name as session_name, s.role as session_role
            FROM updates u JOIN sessions s ON s.id = u.session_id
+           WHERE (? IS NULL OR s.team_key = ?)
            ORDER BY u.created_at DESC LIMIT 10`
         )
-        .all() as any[];
+        .all(teamKey, teamKey) as any[];
 
       const out: string[] = [];
-      out.push(renderAgents(db));
+      out.push(cabecalhoEscopo(teamKey));
       out.push("");
-      out.push(renderTeamContext(db));
+      out.push(renderAgents(db, teamKey));
       out.push("");
-      out.push(renderTasks(db));
+      out.push(renderTeamContext(db, teamKey));
       out.push("");
-      out.push(renderWorkItems(db));
+      out.push(renderTasks(db, teamKey));
       out.push("");
-      out.push(renderLocks(db));
+      out.push(renderWorkItems(db, teamKey));
+      out.push("");
+      out.push(renderLocks(db, teamKey));
       out.push("");
       out.push("ÚLTIMAS DECISÕES/ALERTAS:");
       if (!recentDecisions.length) out.push("  (nenhuma)");
@@ -943,7 +1317,7 @@ export const tools: ToolDef[] = [
         out.push(`  [${time}] ${u.session_name} [${u.session_role}]: ${u.progress}`);
       }
       out.push("");
-      out.push(renderRecentChat(db, 15));
+      out.push(renderRecentChat(db, 15, teamKey));
 
       return text(out.join("\n"));
     },
@@ -978,13 +1352,222 @@ export const tools: ToolDef[] = [
   // ─── Agentes persistentes ─────────────────────────────────────────────────
 
   {
-    name: "abrir_ou_retornar_agente",
+    name: "abrir",
     description:
-      "Abre uma sessão para um AGENTE PERSISTENTE. Se já existir agente do mesmo cargo + pasta com status available/paused/dead, retoma automaticamente. Se houver múltiplos candidatos, lista. Caso contrário, cria agente novo com nome humano persistente. Esta é a entrada PREFERIDA — use no lugar de abrir_sessao.",
+      "Entrada única da equipe. Não recebe cargo: elege um único gerente por pasta/equipe, abre ou retoma a identidade, liga o modo auto e, para trabalhadores, já assume o próximo work item pronto. Depois desta chamada siga o próximo_passo retornado sem pedir decisões reversíveis ao gerente.",
     inputSchema: {
       type: "object",
       properties: {
-        cargo: { type: "string", enum: [...ROLES] },
+        projeto: { type: "string", description: "Nome opcional do projeto." },
+        pasta: { type: "string", description: "Pasta da equipe; usa AGENTDESK_FOLDER se omitida." },
+        preferred_name: { type: "string", description: "Nome desejado; retoma se existir ou usa ao criar." },
+        retomar_agente_id: { type: "string", description: "Opcional para retomar uma identidade conhecida." },
+        force_new: { type: "boolean", default: false, description: "Cria novo trabalhador; nunca cria um segundo gerente." },
+        tmux_pane: { type: "string", description: "Pane tmux atual, para push do loop auto." },
+        areas: { type: "array", items: { type: "string" }, description: "Áreas/módulos que pretende mexer." },
+        arquivos_pretendidos: {
+          type: "array",
+          items: { type: "string" },
+          description: "Arquivos fora do escopo do work item que devem ser travados já na entrada.",
+        },
+      },
+    },
+    handler: (args) => {
+      const p = z.object({
+        projeto: z.string().optional().default(""),
+        pasta: z.string().optional().default(""),
+        preferred_name: z.string().optional(),
+        retomar_agente_id: z.string().optional(),
+        force_new: z.boolean().optional().default(false),
+        tmux_pane: z.string().optional(),
+        areas: z.array(z.string()).optional().default([]),
+        arquivos_pretendidos: z.array(z.string()).optional().default([]),
+      }).parse(args ?? {});
+
+      const db = getDb();
+      sweepSessions(db);
+      // Sem pasta explícita, herda do ambiente (evita o balde 'default').
+      const folder = p.pasta || process.env.AGENTDESK_FOLDER || process.cwd();
+      const teamKey = deriveTeamKey(folder, p.projeto);
+      const pane = p.tmux_pane || envTmuxPane();
+      let agent: AgentRow | null = null;
+      let mode: "created" | "resumed" | "already_open" = "created";
+
+      if (p.retomar_agente_id) {
+        agent = findAgentById(db, p.retomar_agente_id);
+        if (!agent || agent.status === "archived") throw new Error("A identidade pedida não existe ou está arquivada.");
+      } else if (p.preferred_name) {
+        agent = findAgentByName(db, p.preferred_name);
+        if (agent?.status === "archived") throw new Error("A identidade pedida está arquivada.");
+      }
+      if (agent) {
+        if (agent.team_key !== teamKey) {
+          throw new Error(`O agente ${agent.name} pertence a outra equipe (${agent.team_key}).`);
+        }
+        mode = "resumed";
+      }
+
+      let manager = findManagerForTeam(db, teamKey);
+      let lostManagerElection = false;
+      if (!agent && !manager) {
+        const elected = createOrGetManager(db, {
+          name: p.preferred_name && !findAgentByName(db, p.preferred_name)
+            ? p.preferred_name
+            : pickUniqueName(db),
+          role: MANAGER_ROLE,
+          team_key: teamKey,
+          project: p.projeto,
+          folder,
+          tmux_pane: pane,
+        });
+        manager = elected.agent;
+        if (elected.created) {
+          agent = elected.agent;
+          mode = "created";
+        } else {
+          // Outra janela venceu a eleição enquanto esta aguardava o write
+          // lock. Esta janela vira capacidade de trabalho, não uma segunda
+          // sessão apontando para a mesma identidade de gerente.
+          lostManagerElection = true;
+        }
+      }
+
+      if (!agent && manager && !p.force_new) {
+        // Identidade da própria pane é a retomada mais confiável.
+        if (pane) {
+          agent = (db.prepare(
+            `SELECT * FROM agents
+             WHERE team_key = ? AND tmux_pane = ? AND status != 'archived'
+             ORDER BY updated_at DESC LIMIT 1`
+          ).get(teamKey, pane) as AgentRow | undefined) ?? null;
+        }
+
+        // Se o gerente ainda não está rodando, a primeira janela que volta
+        // retoma a coordenação. As próximas janelas pegam trabalhadores.
+        if (!agent && !lostManagerElection && ["paused", "dead"].includes(manager.status)) agent = manager;
+
+        if (!agent) {
+          agent = (db.prepare(
+            `SELECT * FROM agents
+             WHERE team_key = ? AND authority = 'worker'
+               AND status IN ('available','paused','dead')
+             ORDER BY CASE status WHEN 'paused' THEN 0 WHEN 'dead' THEN 1 ELSE 2 END,
+                      updated_at DESC
+             LIMIT 1`
+          ).get(teamKey) as AgentRow | undefined) ?? null;
+        }
+        if (agent) mode = "resumed";
+      }
+
+      if (!agent) {
+        const requestedName = p.preferred_name && !findAgentByName(db, p.preferred_name)
+          ? p.preferred_name
+          : pickUniqueName(db);
+        agent = createAgent(db, {
+          name: requestedName,
+          role: AVAILABLE_ROLE,
+          authority: "worker",
+          team_key: teamKey,
+          project: p.projeto,
+          folder,
+          tmux_pane: pane,
+        });
+        mode = "created";
+      }
+
+      // Repetir /abrir na mesma janela é idempotente.
+      if (agent.current_session_id) {
+        const live = db.prepare("SELECT * FROM sessions WHERE id = ?")
+          .get(agent.current_session_id) as SessionRow | undefined;
+        if (live && ["active", "suspect"].includes(deriveStatus(live))) {
+          if (pane) db.prepare("UPDATE agents SET tmux_pane = ? WHERE id = ?").run(pane, agent.id);
+          setAgentAutoMode(db, agent.id, true, pane);
+          const claimed = autoClaimNext(db, live, agent);
+          mode = "already_open";
+          return text([
+            `ABERTO · ${agent.name}/${agent.role}`,
+            `agent_id: ${agent.id}`,
+            `session_id: ${live.id}`,
+            `team_key: ${teamKey}`,
+            `autoridade: ${isManagerAgent(agent) ? "gerente" : "trabalhador"}`,
+            "auto_mode: ATIVO",
+            claimed ? `work_item: ${claimed.id} · ${claimed.title}` : "work_item: nenhum pronto",
+            isManagerAgent(agent)
+              ? "proximo_passo: receba a lista do usuário e chame distribuir_tarefas uma vez."
+              : claimed
+                ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
+                : "proximo_passo: chame tick_autonomo compacto; a fila será assumida automaticamente quando houver item pronto.",
+            renderContextoEntrada(db, teamKey, agent, live.id, p.arquivos_pretendidos, p.areas),
+          ].join("\n"));
+        }
+      }
+
+      const initialTask = isManagerAgent(agent)
+        ? "Coordenar a fila da equipe"
+        : "Assumir o próximo item pronto";
+      const opened = openSession(db, {
+        cargo: agent.role,
+        tarefa: initialTask,
+        projeto: p.projeto || agent.project || "",
+        pasta: folder || agent.folder || "",
+        areas: p.areas,
+        arquivos_pretendidos: p.arquivos_pretendidos,
+        agent,
+        teamKey,
+      });
+      setAgentAutoMode(db, agent.id, true, pane);
+      // openSession atualiza o registro; recarrega para current_task/session.
+      agent = findAgentById(db, agent.id)!;
+      const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(opened.sessionId) as SessionRow;
+      const claimed = autoClaimNext(db, session, agent);
+
+      recordEvent(db, opened.sessionId, "agent.open_auto", {
+        agent_id: agent.id,
+        team_key: teamKey,
+        authority: agent.authority,
+        work_item_id: claimed?.id ?? null,
+      });
+      postChat(db, {
+        sessionId: opened.sessionId,
+        sessionName: opened.sessionName,
+        role: agent.role,
+        type: "falar",
+        agentId: agent.id,
+        agentName: agent.name,
+        message: isManagerAgent(agent)
+          ? "Gerente online em modo auto; pronto para distribuir uma lista."
+          : claimed
+            ? `Online em modo auto; assumi ${claimed.id}: ${claimed.title}.`
+            : "Online em modo auto; aguardando fila sem bloquear a equipe.",
+      });
+
+      return text([
+        `${mode === "created" ? "ABERTO" : "RETOMADO"} · ${agent.name}/${agent.role}`,
+        `agent_id: ${agent.id}`,
+        `session_id: ${opened.sessionId}`,
+        `task_id: ${opened.taskId}`,
+        `team_key: ${teamKey}`,
+        `autoridade: ${isManagerAgent(agent) ? "gerente" : "trabalhador"}`,
+        "auto_mode: ATIVO",
+        claimed ? `work_item: ${claimed.id} · ${claimed.title}` : "work_item: nenhum pronto",
+        isManagerAgent(agent)
+          ? "proximo_passo: receba a lista do usuário e chame distribuir_tarefas uma vez."
+          : claimed
+            ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
+            : "proximo_passo: rode tick_autonomo compacto; ele assumirá automaticamente o primeiro item pronto.",
+        renderContextoEntrada(db, teamKey, agent, opened.sessionId, p.arquivos_pretendidos, p.areas),
+      ].join("\n"));
+    },
+  },
+
+  {
+    name: "abrir_ou_retornar_agente",
+    description:
+      "Compatibilidade. Sem cargo, encaminha para a entrada única abrir (gerente eleito, papel dinâmico e auto imediato). Com cargo, mantém o fluxo legado.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cargo: { type: "string", description: "Papel livre (opcional no fluxo novo)." },
         tarefa: { type: "string", description: "Opcional em retomada — se omitida, mantém a tarefa anterior do agente." },
         projeto: { type: "string" },
         pasta: { type: "string", description: "Pasta de trabalho (chave de match com agentes existentes)." },
@@ -995,11 +1578,14 @@ export const tools: ToolDef[] = [
         retomar_agente_id: { type: "string", description: "ID de agente específico a retomar." },
         tmux_pane: { type: "string", description: "Valor de $TMUX_PANE da pane atual (ex: %42). Passa explicitamente via Bash." },
       },
-      required: ["cargo"],
     },
     handler: (args) => {
+      if (!args?.cargo) {
+        const preferred = tools.find((tool) => tool.name === "abrir");
+        return preferred!.handler(args ?? {});
+      }
       const schema = z.object({
-        cargo: z.enum(ROLES as any),
+        cargo: z.string().min(1),
         tarefa: z.string().optional(),
         projeto: z.string().optional().default(""),
         pasta: z.string().optional().default(""),
@@ -1020,6 +1606,14 @@ export const tools: ToolDef[] = [
       if (p.retomar_agente_id) {
         agent = findAgentById(db, p.retomar_agente_id);
         if (!agent) throw new Error(`Agente ${p.retomar_agente_id} não encontrado.`);
+        // Mesma regra do abrir: arquivado não retoma por acidente. Antes este
+        // caminho era o único que ignorava o arquivamento e "desarquivava"
+        // sem querer. O caminho legítimo é desarquivar_agente.
+        if (agent.status === "archived") {
+          throw new Error(
+            `Agente ${agent.name} está arquivado. Use desarquivar_agente antes de retomar.`
+          );
+        }
         mode = "resumed";
       } else if (p.preferred_name) {
         const existing = findAgentByName(db, p.preferred_name);
@@ -1035,7 +1629,7 @@ export const tools: ToolDef[] = [
       // duplicava agentes (Lara + Igor mesmo backend, mesma pasta).
       let effectiveFolder = p.pasta;
       if (!effectiveFolder) {
-        effectiveFolder = process.env.AGENTDESK_FOLDER || "";
+        effectiveFolder = process.env.AGENTDESK_FOLDER || process.cwd();
       }
 
       if (!agent && !p.force_new) {
@@ -1081,8 +1675,12 @@ export const tools: ToolDef[] = [
         agent = createAgent(db, {
           name,
           role: p.cargo,
+          authority: p.cargo === MANAGER_ROLE && !findManagerForTeam(db, deriveTeamKey(effectiveFolder, p.projeto))
+            ? "manager"
+            : "worker",
+          team_key: deriveTeamKey(effectiveFolder, p.projeto),
           project: p.projeto,
-          folder: p.pasta,
+          folder: effectiveFolder,
           tmux_pane: resolvedPane,
         });
         mode = "created";
@@ -1116,11 +1714,15 @@ export const tools: ToolDef[] = [
             cargo: p.cargo,
             tarefa: resolvedTarefa,
             projeto: p.projeto,
-            pasta: p.pasta,
+            pasta: effectiveFolder,
             areas: p.areas,
             arquivos_pretendidos: p.arquivos_pretendidos,
             agent,
+            teamKey: agent.team_key,
           });
+
+      // Abertura passa a implicar auto também no alias antigo.
+      setAgentAutoMode(db, agent.id, true, resolvedPane);
 
       recordEvent(db, sessionId, mode === "resumed" ? "agent.resumed" : "agent.created", {
         agent_id: agent.id,
@@ -1188,7 +1790,8 @@ export const tools: ToolDef[] = [
           `agent_id: ${agent.id}`,
           `session_id: ${sessionId}  (nome: ${sessionName})`,
           `task_id: ${taskId}`,
-          `Cargo: ${p.cargo}  Pasta: ${p.pasta || "—"}`,
+          `Papel: ${p.cargo}  Pasta: ${effectiveFolder || "—"}`,
+          "auto_mode: ATIVO",
           "",
           ...restoreLines,
           "── INBOX ──",
@@ -1206,19 +1809,23 @@ export const tools: ToolDef[] = [
 
   {
     name: "listar_agentes",
-    description: "Lista todos os agentes (com nome, cargo, status, tarefa atual, última atividade). Útil pra ver quem está disponível pra retomada.",
+    description: "Lista agentes da equipe do chamador (todas_equipes=true para todos) com nome, autoridade, papel atual, status, tarefa e atividade.",
     inputSchema: {
       type: "object",
       properties: {
         incluir_arquivados: { type: "boolean", default: false },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
       sweepSessions(db);
-      const agents = listAgents(db, { include_archived: !!args?.incluir_arquivados });
-      if (!agents.length) return text("Nenhum agente registrado.");
-      const lines: string[] = [`Total: ${agents.length} agente(s).`, ""];
+      const teamKey = resolveTeamScope(db, args);
+      const agents = teamKey
+        ? listAgentsForTeam(db, teamKey, { include_archived: !!args?.incluir_arquivados })
+        : listAgents(db, { include_archived: !!args?.incluir_arquivados });
+      if (!agents.length) return text(`Nenhum agente registrado. ${cabecalhoEscopo(teamKey)}`);
+      const lines: string[] = [cabecalhoEscopo(teamKey), `Total: ${agents.length} agente(s).`, ""];
       for (const a of agents) {
         const sess = a.current_session_id
           ? (db.prepare("SELECT name, status FROM sessions WHERE id = ?").get(a.current_session_id) as
@@ -1232,7 +1839,7 @@ export const tools: ToolDef[] = [
           : null;
         const upd = new Date(a.updated_at).toISOString().replace("T", " ").slice(0, 19);
         lines.push(
-          `- ${a.name} [${a.role}] status=${a.status} (atualizado ${upd})\n    id: ${a.id}\n    pasta: ${a.folder || "—"}    projeto: ${a.project || "—"}\n    sessão atual: ${sess ? `${sess.name} (${sess.status})` : "—"}\n    tarefa atual: ${task ? `${task.title} [${task.status}]` : "—"}`
+          `- ${a.name} [${a.role}] autoridade=${a.authority} status=${anotaSemNoticias(a.status, a.last_heartbeat)} (atualizado ${upd})\n    id: ${a.id}  equipe: ${a.team_key}\n    pasta: ${a.folder || "—"}    projeto: ${a.project || "—"}\n    sessão atual: ${sess ? `${sess.name} (${sess.status})` : "—"}\n    tarefa atual: ${task ? `${task.title} [${task.status}]` : "—"}`
         );
       }
       return text(lines.join("\n"));
@@ -1246,7 +1853,7 @@ export const tools: ToolDef[] = [
       type: "object",
       properties: {
         agent: { type: "string", description: "agent_id ou nome do agente (ex: 'Jonathan')." },
-        cargo: { type: "string", enum: [...ROLES], description: "Opcional — sobrescreve o cargo." },
+        cargo: { type: "string", description: "Opcional — sobrescreve o papel, sem alterar autoridade." },
         tarefa: { type: "string" },
         projeto: { type: "string" },
         pasta: { type: "string" },
@@ -1361,7 +1968,7 @@ export const tools: ToolDef[] = [
         message: `Pausando. ${args.motivo ?? ""}`.trim(),
       });
       recordEvent(db, s.id, "agent.paused", { agent_id: ag.id, motivo: args.motivo ?? null });
-      return text(`Agente ${ag.name} pausado. Sessão ${s.name} fechada. Pode ser retomado com /abrir (mesmo cargo+pasta) ou retomar_agente.`);
+      return text(`Agente ${ag.name} pausado. Sessão ${s.name} fechada. Pode ser retomado com /abrir ou retomar_agente.`);
     },
   },
 
@@ -1389,14 +1996,56 @@ export const tools: ToolDef[] = [
       }
       setAgentStatus(db, ag.id, "archived", { current_session_id: null, current_task_id: null });
       recordEvent(db, null, "agent.archived", { agent_id: ag.id, agent_name: ag.name });
-      return text(`Agente ${ag.name} arquivado. Histórico preservado.`);
+      return text(`Agente ${ag.name} arquivado. Histórico preservado. Para reativar depois: desarquivar_agente.`);
+    },
+  },
+
+  {
+    name: "desarquivar_agente",
+    description:
+      "Reativa um agente arquivado (volta como 'paused', pronto para retomar com abrir). Se a equipe já elegeu outro gerente nesse meio tempo, o desarquivado volta como trabalhador.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "agent_id ou nome." },
+      },
+      required: ["agent"],
+    },
+    handler: (args) => {
+      const db = getDb();
+      const ag = getAgentByIdentifier(db, args.agent);
+      if (!ag) throw new Error(`Agente '${args.agent}' não encontrado.`);
+      if (ag.status !== "archived") {
+        return text(`Agente ${ag.name} não está arquivado (status=${ag.status}). Nada a fazer.`);
+      }
+      const ts = now();
+      const tx = db.transaction(() => {
+        // A equipe só pode ter um gerente ativo (índice único). Se outro foi
+        // eleito enquanto este esteve arquivado, ele volta como trabalhador.
+        if (ag.authority === "manager") {
+          const atual = findManagerForTeam(db, ag.team_key);
+          if (atual && atual.id !== ag.id) {
+            db.prepare("UPDATE agents SET authority = 'worker', updated_at = ? WHERE id = ?").run(ts, ag.id);
+          }
+        }
+        db.prepare(
+          "UPDATE agents SET status = 'paused', updated_at = ?, current_session_id = NULL, current_task_id = NULL WHERE id = ?"
+        ).run(ts, ag.id);
+      });
+      tx.immediate();
+      const depois = findAgentById(db, ag.id)!;
+      recordEvent(db, null, "agent.unarchived", { agent_id: ag.id, agent_name: ag.name });
+      return text(
+        `Agente ${ag.name} desarquivado (status paused, autoridade ${depois.authority === "manager" ? "gerente" : "trabalhador"}). ` +
+          `Retome com abrir (retomar_agente_id=${ag.id}).`
+      );
     },
   },
 
   {
     name: "inbox_agente",
     description:
-      "Retorna o que está pendente para o agente da sessão atual: pedidos direcionados (por nome ou por cargo), alertas críticos do gerente e handoffs pendentes — tudo desde o último heartbeat conhecido do agente.",
+      "Retorna pendências do agente atual por nome ou papel, alertas e handoffs desde o último cursor.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1425,6 +2074,246 @@ export const tools: ToolDef[] = [
   // ─── Work items estruturados ─────────────────────────────────────────────
 
   {
+    name: "atribuir_papel",
+    description:
+      "O gerente atribui ou troca o papel livre de um agente da mesma equipe. Papel não concede autoridade e não vem de uma lista fixa.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        agente: { type: "string", description: "Nome ou agent_id do trabalhador." },
+        papel: { type: "string", description: "Papel curto decidido pelo gerente para o trabalho atual." },
+      },
+      required: ["session_id", "agente", "papel"],
+    },
+    handler: (args) => {
+      const parsed = z.object({
+        session_id: z.string().min(1),
+        agente: z.string().min(1),
+        papel: z.string().trim().min(1).max(80),
+      }).parse(args);
+      const db = getDb();
+      const session = requireActiveSession(db, parsed.session_id);
+      const manager = getManagerForSession(db, session);
+      const updated = assignAgentRole(db, {
+        managerAgentId: manager.id,
+        target: parsed.agente,
+        role: parsed.papel,
+      });
+      postChat(db, {
+        sessionId: session.id,
+        sessionName: session.name,
+        role: session.role,
+        type: "decisao",
+        to: updated.name,
+        message: `Papel atual: ${updated.role}. Assuma decisões reversíveis dentro desse escopo sem aguardar aprovação.`,
+        agentId: manager.id,
+        agentName: manager.name,
+      });
+      recordEvent(db, session.id, "agent.role_assigned", {
+        target: updated.id,
+        role: updated.role,
+      });
+      return text(`Papel atribuído: ${updated.name} -> ${updated.role}\nautoridade: trabalhador (inalterada)`);
+    },
+  },
+
+  {
+    name: "distribuir_tarefas",
+    description:
+      "Gerente transforma uma lista inteira em work items numa chamada e os balanceia entre trabalhadores ativos. Aceita dependências por chave do mesmo lote; itens prontos rodam em paralelo e excedentes ficam na fila para work stealing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        tarefas: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              chave: { type: "string", description: "Apelido único para dependências dentro do lote." },
+              titulo: { type: "string" },
+              descricao: { type: "string" },
+              aceite: { type: "string" },
+              prioridade: { type: "string", enum: ["baixa", "normal", "alta", "critica"] },
+              papel: { type: "string", description: "Papel livre escolhido pelo gerente." },
+              para: { type: "string", description: "Nome/ID explícito de um trabalhador, se necessário." },
+              areas: { type: "array", items: { type: "string" } },
+              arquivos_ou_escopos: { type: "array", items: { type: "string" } },
+              dependencias: { type: "array", items: { type: "string" }, description: "Chaves do lote, IDs existentes ou notas." },
+            },
+            required: ["titulo"],
+          },
+        },
+        estrategia: { type: "string", enum: ["balanceada", "especialidade", "fila"], default: "balanceada" },
+        paralelismo: { type: "number", minimum: 1, description: "Máximo de trabalhadores usados de imediato." },
+      },
+      required: ["session_id", "tarefas"],
+    },
+    handler: (args) => {
+      const itemSchema = z.object({
+        chave: z.string().trim().min(1).max(80).optional(),
+        titulo: z.string().trim().min(1).max(500),
+        descricao: z.string().optional(),
+        aceite: z.string().optional(),
+        prioridade: z.enum(["baixa", "normal", "alta", "critica"]).optional().default("normal"),
+        papel: z.string().trim().min(1).max(80).optional(),
+        para: z.string().optional(),
+        areas: z.array(z.string()).optional().default([]),
+        arquivos_ou_escopos: z.array(z.string()).optional().default([]),
+        dependencias: z.array(z.string()).optional().default([]),
+      });
+      const p = z.object({
+        session_id: z.string().min(1),
+        tarefas: z.array(itemSchema).min(1).max(100),
+        estrategia: z.enum(["balanceada", "especialidade", "fila"]).optional().default("balanceada"),
+        paralelismo: z.number().int().positive().optional(),
+      }).parse(args);
+
+      const db = getDb();
+      const session = requireActiveSession(db, p.session_id);
+      const manager = getManagerForSession(db, session);
+      const teamKey = teamKeyForSession(session, manager);
+      const keys = new Set<string>();
+      for (const [index, task] of p.tarefas.entries()) {
+        const key = task.chave ?? String(index + 1);
+        if (keys.has(key)) throw new Error(`Chave duplicada no lote: ${key}.`);
+        keys.add(key);
+      }
+      for (const task of p.tarefas) {
+        for (const dependency of task.dependencias) {
+          if (keys.has(dependency)) continue;
+          const existing = getWorkItem(db, dependency);
+          if (existing && existing.team_key === teamKey) continue;
+          // Tokens simples são referências, não notas: um typo não pode criar
+          // um lote parcialmente impossível. Para contexto livre use "nota:...".
+          if (!dependency.startsWith("nota:")) {
+            throw new Error(
+              `Dependência '${dependency}' não corresponde a uma chave do lote nem a um work item da equipe. ` +
+              `Prefixe notas livres com 'nota:'.`
+            );
+          }
+        }
+      }
+
+      const allWorkers = listAgentsForTeam(db, teamKey)
+        .filter((agent) => !isManagerAgent(agent) && !["archived", "dead"].includes(agent.status));
+      const liveWorkers = allWorkers.filter((agent) => {
+        if (!agent.current_session_id) return false;
+        const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(agent.current_session_id) as SessionRow | undefined;
+        return !!row && ["active", "suspect"].includes(deriveStatus(row));
+      });
+      const workerLimit = Math.min(p.paralelismo ?? liveWorkers.length, liveWorkers.length);
+      const workers = liveWorkers.slice(0, workerLimit);
+      const loads = new Map<string, number>();
+      for (const worker of workers) {
+        const row = db.prepare(
+          `SELECT COUNT(*) AS n FROM work_items
+           WHERE team_key = ? AND status IN ('queued','claimed','working')
+             AND (assigned_to = ? OR owner_agent_id = ?)`
+        ).get(teamKey, worker.name, worker.id) as { n: number };
+        loads.set(worker.id, row.n);
+      }
+
+      const planned = p.tarefas.map((task, index) => {
+        const role = task.papel || (task.areas[0] ? `especialista:${task.areas[0]}` : "generalista");
+        let target: AgentRow | null = null;
+        if (task.para) {
+          target = getAgentByIdentifier(db, task.para);
+          if (!target || target.team_key !== teamKey || target.status === "archived" || isManagerAgent(target)) {
+            throw new Error(`Destino '${task.para}' não é um trabalhador ativo desta equipe.`);
+          }
+        } else if (p.estrategia !== "fila" && workers.length) {
+          const candidates = p.estrategia === "especialidade"
+            ? [...workers].sort((a, b) => {
+                const affinity = Number(b.role === role) - Number(a.role === role);
+                return affinity || (loads.get(a.id)! - loads.get(b.id)!);
+              })
+            : [...workers].sort((a, b) => loads.get(a.id)! - loads.get(b.id)!);
+          target = candidates[0] ?? null;
+        }
+        if (target) loads.set(target.id, (loads.get(target.id) ?? 0) + 1);
+        return { task, index, key: task.chave ?? String(index + 1), role, target };
+      });
+
+      const created: Array<{ key: string; item: WorkItemRow; role: string; target: AgentRow | null }> = [];
+      const tx = db.transaction(() => {
+        for (const plan of planned) {
+          const item = createWorkItem(db, {
+            title: plan.task.titulo,
+            description: plan.task.descricao ?? null,
+            acceptance: plan.task.aceite ?? "Entregar com validação objetiva; escalar somente risco irreversível ou bloqueio externo.",
+            priority: plan.task.prioridade,
+            team_key: teamKey,
+            project: session.project ?? manager.project,
+            folder: session.folder ?? manager.folder,
+            areas: plan.task.areas,
+            intended_files: plan.task.arquivos_ou_escopos,
+            dependencies: [],
+            assigned_to: plan.target?.name ?? null,
+            assigned_role: plan.role,
+            created_by_session: session.id,
+            created_by_agent: manager.name,
+          });
+          created.push({ key: plan.key, item, role: plan.role, target: plan.target });
+        }
+        const idByKey = new Map(created.map((entry) => [entry.key, entry.item.id]));
+        for (const entry of created) {
+          const original = planned.find((plan) => plan.key === entry.key)!;
+          const dependencies = original.task.dependencias.map((dependency) => idByKey.get(dependency) ?? dependency);
+          db.prepare("UPDATE work_items SET dependencies = ?, updated_at = ? WHERE id = ?")
+            .run(dependencies.length ? JSON.stringify(dependencies) : null, now(), entry.item.id);
+          entry.item = getWorkItem(db, entry.item.id)!;
+        }
+      });
+      tx.immediate();
+
+      // Um trabalhador disponível passa a se identificar pelo primeiro papel
+      // que o gerente acabou de lhe atribuir. Autoridade não muda.
+      const firstByTarget = new Map<string, string>();
+      for (const entry of created) {
+        if (entry.target && !firstByTarget.has(entry.target.id)) firstByTarget.set(entry.target.id, entry.role);
+      }
+      for (const [targetId, role] of firstByTarget) {
+        const target = findAgentById(db, targetId);
+        if (target && target.role === AVAILABLE_ROLE) {
+          assignAgentRole(db, { managerAgentId: manager.id, target: target.id, role });
+        }
+      }
+
+      postChat(db, {
+        sessionId: session.id,
+        sessionName: session.name,
+        role: session.role,
+        type: "decisao",
+        message: `Lote distribuído: ${created.length} itens, ${new Set(created.map((entry) => entry.target?.id).filter(Boolean)).size} trabalhadores imediatos, estratégia ${p.estrategia}.`,
+        agentId: manager.id,
+        agentName: manager.name,
+      });
+      recordEvent(db, session.id, "work_items.batch_distributed", {
+        count: created.length,
+        strategy: p.estrategia,
+        parallelism: workerLimit,
+        ids: created.map((entry) => entry.item.id),
+      });
+
+      const lines = [
+        `LOTE DISTRIBUÍDO · ${created.length} itens · paralelismo imediato ${new Set(created.map((entry) => entry.target?.id).filter(Boolean)).size}`,
+      ];
+      for (const entry of created) {
+        const deps = parseJsonList(entry.item.dependencies);
+        lines.push(
+          `- ${entry.key}=${entry.item.id} [${entry.item.priority}] -> ${entry.target?.name ?? "fila"}/${entry.role}: ${entry.item.title}${deps.length ? ` (dep: ${deps.join(",")})` : ""}`
+        );
+      }
+      lines.push("Agentes em auto assumem itens prontos sem nova decisão do gerente.");
+      return text(lines.join("\n"));
+    },
+  },
+
+  {
     name: "criar_tarefa_estruturada",
     description:
       "Cria uma tarefa estruturada com dono/alvo, escopos de arquivo, dependências e critério de aceite. Preferível a delegar só por chat quando há mais de um Claude trabalhando.",
@@ -1436,7 +2325,7 @@ export const tools: ToolDef[] = [
         descricao: { type: "string" },
         aceite: { type: "string", description: "Critério objetivo para considerar pronto." },
         prioridade: { type: "string", enum: ["baixa", "normal", "alta", "critica"], default: "normal" },
-        para: { type: "string", description: "Nome do agente ou cargo alvo." },
+        para: { type: "string", description: "Nome do agente ou papel atual alvo." },
         projeto: { type: "string" },
         pasta: { type: "string" },
         areas: { type: "array", items: { type: "string" } },
@@ -1451,18 +2340,13 @@ export const tools: ToolDef[] = [
       const ag = getAgentByActiveSession(db, s.id);
       const target = args.para as string | undefined;
       const targetAgent = target ? getAgentByIdentifier(db, target) : null;
-      // Valida: se 'para' foi passado, deve ser cargo válido OU agente vivo.
-      // Antes: aceitava qualquer string e a tarefa ficava "no vazio".
-      if (target && !targetAgent && !ROLES.includes(target as any)) {
-        throw new Error(
-          `'para'='${target}' não é cargo válido (${ROLES.join(", ")}) nem agente registrado. ` +
-            `Use /agentes pra ver opções, ou omita 'para' pra deixar livre.`
-        );
-      }
       if (targetAgent && targetAgent.status === "archived") {
         throw new Error(
           `Agente ${targetAgent.name} está arquivado. Escolha outro destinatário ou desarquive antes.`
         );
+      }
+      if (targetAgent && targetAgent.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error(`Agente ${targetAgent.name} pertence a outra equipe.`);
       }
       // Valida dependências: cada string que parece work_item_id (12 chars
       // alfanuméricos/_-) precisa existir. Notas livres passam.
@@ -1483,13 +2367,14 @@ export const tools: ToolDef[] = [
         description: args.descricao ?? null,
         acceptance: args.aceite ?? null,
         priority: args.prioridade ?? "normal",
+        team_key: teamKeyForSession(s, ag),
         project: args.projeto ?? s.project ?? null,
         folder: args.pasta ?? s.folder ?? null,
         areas: args.areas ?? [],
         intended_files: args.arquivos_ou_escopos ?? [],
         dependencies: args.dependencias ?? [],
-        assigned_to: targetAgent ? targetAgent.name : target ?? null,
-        assigned_role: targetAgent ? targetAgent.role : target && ROLES.includes(target as any) ? target : null,
+        assigned_to: targetAgent ? targetAgent.name : null,
+        assigned_role: targetAgent ? targetAgent.role : target ?? null,
         created_by_session: s.id,
         created_by_agent: ag?.name ?? null,
       });
@@ -1514,20 +2399,27 @@ export const tools: ToolDef[] = [
   {
     name: "listar_tarefas_estruturadas",
     description:
-      "Lista work items estruturados. Pode filtrar por status ou por agente/cargo alvo.",
+      "Lista work items estruturados da equipe do chamador (todas_equipes=true para todos). Pode filtrar por status, agente ou papel atual.",
     inputSchema: {
       type: "object",
       properties: {
         status: { type: "string", enum: ["queued", "claimed", "working", "blocked", "review", "done", "canceled"] },
-        para: { type: "string", description: "Nome do agente ou cargo." },
+        para: { type: "string", description: "Nome do agente ou papel atual." },
         limite: { type: "number", default: 30 },
+        ...ESCOPO_PROPS,
       },
     },
     handler: (args) => {
       const db = getDb();
-      const rows = listWorkItems(db, { status: args?.status ?? null, assigned: args?.para ?? null, limit: args?.limite ?? 30 });
-      if (!rows.length) return text("Nenhum work item encontrado.");
-      return text(rows.map(formatWorkItem).join("\n\n"));
+      const teamKey = resolveTeamScope(db, args);
+      const rows = listWorkItems(db, {
+        status: args?.status ?? null,
+        assigned: args?.para ?? null,
+        limit: args?.limite ?? 30,
+        team_key: teamKey,
+      });
+      if (!rows.length) return text(`Nenhum work item encontrado. ${cabecalhoEscopo(teamKey)}`);
+      return text([cabecalhoEscopo(teamKey), "", ...rows.map(formatWorkItem)].join("\n\n"));
     },
   },
 
@@ -1551,6 +2443,9 @@ export const tools: ToolDef[] = [
       const ag = getAgentByActiveSession(db, s.id);
       const itemBefore = getWorkItem(db, args.work_item_id);
       if (!itemBefore) throw new Error(`Work item ${args.work_item_id} não encontrado.`);
+      if (!ag || itemBefore.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error("Work item pertence a outra equipe.");
+      }
 
       // Etapa 1: tenta locks ANTES de claim. Se houver conflito, o item nem sai
       // de "queued" — outro agente pode assumir. Antes: o item ficava "working"
@@ -1581,6 +2476,9 @@ export const tools: ToolDef[] = [
       // Se locks falharam, marca o item como blocked SEM virar dono — outro
       // agente pode assumir quando o lock for liberado.
       if (lockConflictReason) {
+        // acquireLocks pode ter concedido escopos anteriores antes de achar o
+        // conflito; devolve tudo para não deixar lock parcial órfão.
+        releaseLocks(db, s.id, scopes);
         updateWorkItemStatus(db, args.work_item_id, "blocked", { blocked_reason: lockConflictReason });
         recordEvent(db, s.id, "work_item.lock_conflict", { id: args.work_item_id, reason: lockConflictReason });
         return text([
@@ -1599,12 +2497,16 @@ export const tools: ToolDef[] = [
           agent_id: ag?.id ?? null,
           agent_name: ag?.name ?? s.name,
           session_id: s.id,
+          agent_role: ag?.role ?? s.role,
+          allow_role_adoption: ag?.role === AVAILABLE_ROLE,
         });
       } catch (e) {
         // Rollback dos locks que acabamos de pegar — outro agente é o dono.
         if (scopes.length) releaseLocks(db, s.id, scopes);
         throw e;
       }
+
+      if (ag) adoptWorkItemRole(db, s, ag, item);
 
       // Etapa 3: worktree (opcional). Falha aqui NÃO desfaz o claim — o item
       // continua "working" sem worktree, e o agente pode trabalhar in-place.
@@ -1657,10 +2559,13 @@ export const tools: ToolDef[] = [
       const ag = getAgentByActiveSession(db, s.id);
       const current = getWorkItem(db, args.work_item_id);
       if (!current) throw new Error(`Work item ${args.work_item_id} não encontrado.`);
+      if (!ag || current.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error("Work item pertence a outra equipe.");
+      }
 
       // Só o dono ou o gerente pode bloquear. Antes: qualquer um podia.
       const isOwner = !!ag && current.owner_agent_id === ag.id;
-      const isGerente = s.role === "gerente";
+      const isGerente = isManagerAgent(ag);
       if (!isOwner && !isGerente) {
         throw new Error(
           `Apenas o dono (${current.owner_agent_name ?? "—"}) ou um gerente pode bloquear o work item ${current.id}.`
@@ -1678,7 +2583,17 @@ export const tools: ToolDef[] = [
         agentName: ag?.name ?? null,
       });
       recordEvent(db, s.id, "work_item.blocked", { id: item.id, reason: args.motivo });
-      return text(`Work item bloqueado:\n${formatWorkItem(item)}`);
+      let next: WorkItemRow | null = null;
+      if (isOwner && ag) {
+        releaseLocks(db, s.id);
+        next = autoClaimNext(db, s, ag);
+      }
+      return text([
+        `Work item bloqueado: ${item.id} · ${args.motivo}`,
+        next
+          ? `Próximo item assumido sem espera: ${next.id} · ${next.title}`
+          : "Sem outro item pronto; o bloqueio foi escalado de forma assíncrona.",
+      ].join("\n"));
     },
   },
 
@@ -1703,6 +2618,9 @@ export const tools: ToolDef[] = [
       const ag = getAgentByActiveSession(db, s.id);
       const current = getWorkItem(db, args.work_item_id);
       if (!current) throw new Error(`Work item ${args.work_item_id} não encontrado.`);
+      if (!ag || current.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error("Work item pertence a outra equipe.");
+      }
 
       // Só o dono entrega. Antes: qualquer agente podia entregar tarefa alheia
       // (e ainda liberava locks do entregador, não do dono).
@@ -1731,14 +2649,20 @@ export const tools: ToolDef[] = [
         agentName: ag?.name ?? null,
       });
       recordEvent(db, s.id, "work_item.delivered", { id: item.id, released });
-      return text(`Work item entregue para review. Travas liberadas: ${released}\n${formatWorkItem(item)}`);
+      const next = autoClaimNext(db, s, ag);
+      return text([
+        `Entregue: ${item.id} -> review assíncrono. Travas liberadas: ${released}.`,
+        next
+          ? `Próximo item assumido sem espera: ${next.id} · ${next.title}`
+          : "Fila pronta vazia; continue em auto.",
+      ].join("\n"));
     },
   },
 
   {
     name: "revisar_tarefa",
     description:
-      "QA/gerente aprova ou reprova um work item entregue. Aprovação marca done; reprovação volta para blocked com motivo.",
+      "Revisão assíncrona por gerente ou por qualquer par da mesma equipe que não seja o autor. Não exige cargo fixo de QA.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1753,9 +2677,14 @@ export const tools: ToolDef[] = [
       const db = getDb();
       const s = requireActiveSession(db, args.session_id);
       const ag = getAgentByActiveSession(db, s.id);
-      if (!["qa", "gerente"].includes(s.role)) throw new Error("Apenas qa ou gerente deve revisar work items.");
       const current = getWorkItem(db, args.work_item_id);
       if (!current) throw new Error(`Work item ${args.work_item_id} não encontrado.`);
+      if (!ag || current.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error("A revisão deve ser feita por um agente da mesma equipe.");
+      }
+      if (!isManagerAgent(ag) && current.owner_agent_id === ag.id) {
+        throw new Error("O autor não pode revisar a própria entrega; qualquer outro par da equipe pode.");
+      }
       // Só items em review podem ser revisados (evita aprovar item ainda em
       // working ou já done).
       if (current.status !== "review") {
@@ -1787,11 +2716,14 @@ export const tools: ToolDef[] = [
   {
     name: "tick_autonomo",
     description:
-      "Snapshot completo do que está PENDENTE pro agente da sessão atual — agregando inbox NOVO (desde last_seen_ms), handoffs, tarefa atual e travas próprias. Usado pelo /loop /auto-tick. Retorna texto estruturado com sugestão de próxima ação e delay até a próxima checagem.",
+      "Pulso compacto e ativo do loop: lê somente deltas, assume atomicamente o próximo item pronto, adota o papel escolhido pelo gerente e retorna uma única próxima ação. O modo detalhado é opcional.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string" },
+        modo: { type: "string", enum: ["compacto", "detalhado"], default: "compacto" },
+        auto_assumir: { type: "boolean", default: true },
+        marcar_processado: { type: "boolean", default: true, description: "Avança o cursor apenas até as mensagens retornadas." },
       },
       required: ["session_id"],
     },
@@ -1800,202 +2732,114 @@ export const tools: ToolDef[] = [
       sweepSessions(db);
       const s = requireActiveSession(db, args.session_id);
       const ag = getAgentByActiveSession(db, s.id);
-      if (!ag) throw new Error("Esta sessão não tem agente vinculado. Reabra com abrir_ou_retornar_agente.");
+      if (!ag) throw new Error("Esta sessão não tem agente vinculado. Reabra com abrir.");
 
       db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(now(), s.id);
       touchAgent(db, ag.id);
+      const teamKey = teamKeyForSession(s, ag);
+      const isGerente = isManagerAgent(ag);
+      const current = args.auto_assumir === false ? null : autoClaimNext(db, s, ag);
 
       const since = ag.last_seen_ms || ag.created_at;
-
-      // Mensagens novas direcionadas ao agente (por nome OU por cargo) ou alertas críticos do gerente.
       const newMsgs = db
         .prepare(
           `SELECT * FROM chat_messages
-           WHERE created_at > ?
+           WHERE team_key = ? AND created_at > ?
              AND agent_id IS NOT ?
              AND (
                to_target = ? OR to_target = ?
-               OR (role = 'gerente' AND (type IN ('alerta','passar') OR to_target IS NULL))
-               OR role = 'dono'
-               -- Se EU sou gerente, vejo broadcasts de subordinados (resposta sobe)
-               OR (? = 'gerente' AND to_target IS NULL AND role NOT IN ('gerente','dono'))
+               OR (
+                 EXISTS (SELECT 1 FROM agents sender WHERE sender.id = chat_messages.agent_id AND sender.authority = 'manager')
+                 AND (type IN ('alerta','passar') OR to_target IS NULL)
+               )
+               OR role = 'dono' OR session_id = 'desktop-owner'
+               OR (? = 1 AND to_target IS NULL)
              )
-           ORDER BY created_at ASC LIMIT 50`
+           ORDER BY created_at ASC LIMIT 20`
         )
-        .all(since, ag.id, ag.name, ag.role, ag.role) as any[];
+        .all(teamKey, since, ag.id, ag.name, ag.role, isGerente ? 1 : 0) as any[];
 
-      // Cursor seguro pro próximo marcar_lido: max(created_at) das mensagens RETORNADAS.
-      // Evita o race onde mensagens chegam entre tick_autonomo e marcar_lido e são
-      // marcadas como vistas sem terem sido processadas.
       if (newMsgs.length) {
         const maxTs = newMsgs[newMsgs.length - 1].created_at;
         db.prepare("UPDATE agents SET tick_cursor_ms = ? WHERE id = ?").run(maxTs, ag.id);
+        if (args.marcar_processado !== false) markAgentSeen(db, ag.id, maxTs);
       }
 
       const handoffs = db
         .prepare(
           `SELECT h.*, s2.name as from_name FROM handoffs h
            LEFT JOIN sessions s2 ON s2.id = h.from_session
-           WHERE h.accepted = 0
+           WHERE h.team_key = ? AND h.accepted = 0
              AND (h.to_target = ? OR h.to_target = ?)
            ORDER BY h.created_at ASC LIMIT 10`
         )
-        .all(ag.name, ag.role) as any[];
+        .all(teamKey, ag.name, ag.role) as any[];
 
-      // Tarefa atual + último progresso.
-      const task = ag.current_task_id
-        ? (db.prepare("SELECT * FROM tasks WHERE id = ?").get(ag.current_task_id) as any | undefined)
-        : null;
-      const lastUpdate = task
-        ? (db.prepare("SELECT progress, created_at FROM updates WHERE task_id = ? ORDER BY created_at DESC LIMIT 1").get(task.id) as any | undefined)
-        : null;
-
-      // Travas próprias.
       const myLocks = db
         .prepare("SELECT file_path FROM locks WHERE session_id = ? AND released_at IS NULL")
         .all(s.id) as { file_path: string }[];
-
-      // Conflito potencial: locks de outros agentes nas áreas/arquivos pretendidos.
-      const intended = parseJsonList(s.intended_files);
+      const working = current ?? (db.prepare(
+        `SELECT * FROM work_items WHERE team_key = ? AND owner_agent_id = ? AND status = 'working'
+         ORDER BY updated_at DESC LIMIT 1`
+      ).get(teamKey, ag.id) as WorkItemRow | undefined) ?? null;
+      const intended = working ? parseJsonList(working.intended_files) : parseJsonList(s.intended_files);
       const conflicts = intended.length ? detectConflicts(db, s.id, intended) : [];
-      const workById = new Map<string, WorkItemRow>();
-      for (const w of [
-        ...listWorkItems(db, { assigned: ag.name, limit: 10 }),
-        ...listWorkItems(db, { assigned: ag.role, limit: 10 }),
-      ]) {
-        if (["queued", "claimed", "working", "blocked", "review"].includes(w.status)) workById.set(w.id, w);
-      }
-      const myWorkItems = [...workById.values()].sort((a, b) => b.updated_at - a.updated_at);
+      const summary = db.prepare(
+        `SELECT
+           SUM(status = 'queued') AS queued,
+           SUM(status = 'working') AS working,
+           SUM(status = 'blocked') AS blocked,
+           SUM(status = 'review') AS review
+         FROM work_items WHERE team_key = ?`
+      ).get(teamKey) as { queued: number | null; working: number | null; blocked: number | null; review: number | null };
 
-      const urgentCritical = newMsgs.some(
-        (m) => m.type === "alerta" || (m.type === "pedir" && m.role === "gerente")
-      );
-
-      // Visão da equipe para gerente: quem está ocioso ou sem progresso recente.
-      const isGerente = s.role === "gerente";
-      const idleAgents: { name: string; role: string; idle_min: number; last_summary: string | null }[] = [];
-      if (isGerente) {
-        const teamAgents = db
-          .prepare(
-            `SELECT a.name, a.role, a.last_heartbeat, a.progress_summary, a.status
-             FROM agents a WHERE a.status NOT IN ('archived','dead') AND a.role != 'gerente'`
-          )
-          .all() as any[];
-        const idleThreshold = now() - 5 * 60_000; // 5min sem heartbeat = ocioso
-        for (const a of teamAgents) {
-          if ((a.last_heartbeat || 0) < idleThreshold) {
-            idleAgents.push({
-              name: a.name,
-              role: a.role,
-              idle_min: Math.round((now() - (a.last_heartbeat || 0)) / 60_000),
-              last_summary: a.progress_summary,
-            });
-          }
-        }
-      }
-
-      let suggestion: "AGIR" | "AGUARDAR" | "OCIOSO";
+      const urgent = newMsgs.some((message) => message.type === "alerta" || message.type === "pedir");
+      let action: string;
       let nextDelaySec: number;
-      if (urgentCritical || newMsgs.length || handoffs.length || myWorkItems.some((w) => ["queued", "claimed", "blocked"].includes(w.status))) {
-        suggestion = "AGIR";
+      if (working) {
+        action = conflicts.length
+          ? `RESOLVER_LOCK_OU_BLOQUEAR ${working.id}`
+          : `EXECUTAR ${working.id}`;
         nextDelaySec = 30;
-      } else if (isGerente && idleAgents.length) {
-        // Gerente: time ocioso = precisa delegar novas tarefas.
-        suggestion = "AGIR";
+      } else if (urgent || handoffs.length) {
+        action = "RESPONDER_E_SEGUIR";
+        nextDelaySec = 20;
+      } else if (isGerente && (summary.blocked || summary.review)) {
+        action = `DESTRAVAR_ASSINCRONO blocked=${summary.blocked ?? 0} review=${summary.review ?? 0}`;
         nextDelaySec = 30;
-      } else if (task && task.status === "in_progress") {
-        suggestion = "AGIR";
+      } else if (isGerente) {
+        action = "AGUARDAR_LISTA_OU_EVENTO";
         nextDelaySec = 60;
-      } else if (conflicts.length) {
-        suggestion = "AGUARDAR";
+      } else if (summary.queued) {
+        action = "AGUARDAR_DEPENDENCIA_OU_ATRIBUICAO";
+        nextDelaySec = 45;
+      } else {
+        action = "OCIOSO_SEM_BLOQUEAR";
         nextDelaySec = 120;
-      } else {
-        suggestion = "OCIOSO";
-        nextDelaySec = isGerente ? 60 : 300; // gerente checa mais rápido
       }
 
-      const lines: string[] = [];
-      lines.push(`TICK AUTÔNOMO · ${ag.name}/${ag.role} · ${new Date().toISOString().replace("T", " ").slice(0, 19)}`);
-      lines.push(`session_id: ${s.id}  agent_id: ${ag.id}`);
-      lines.push("");
-
-      lines.push(`INBOX NOVO (${newMsgs.length}):`);
-      if (!newMsgs.length) {
-        lines.push("  (nada novo desde a última checagem)");
-      } else {
-        for (const m of newMsgs) lines.push("  " + formatChatLine(m));
+      const lines = [
+        `TICK ${ag.name}/${ag.role} · ${isGerente ? "gerente" : "trabalhador"}`,
+        `acao: ${action}`,
+        `fila: queued=${summary.queued ?? 0} working=${summary.working ?? 0} blocked=${summary.blocked ?? 0} review=${summary.review ?? 0}`,
+        `inbox: ${newMsgs.length} · handoffs: ${handoffs.length} · locks: ${myLocks.length}`,
+      ];
+      if (working) {
+        lines.push(`item: ${working.id} [${working.priority}] ${working.title}`);
+        if (working.description) lines.push(`contexto: ${working.description}`);
+        if (working.acceptance) lines.push(`aceite: ${working.acceptance}`);
+        if (intended.length) lines.push(`escopos: ${intended.join(", ")}`);
+        if (working.worktree_path) lines.push(`worktree: ${working.worktree_path}`);
       }
-      lines.push("");
-
-      lines.push(`HANDOFFS PENDENTES (${handoffs.length}):`);
-      if (!handoffs.length) {
-        lines.push("  (nenhum)");
-      } else {
-        for (const h of handoffs) {
-          const time = new Date(h.created_at).toISOString().replace("T", " ").slice(0, 19);
-          lines.push(`  [${time}] de ${h.from_name ?? h.from_session} -> ${h.to_target}  task=${h.task_id}: ${h.note}`);
-        }
+      for (const message of newMsgs.slice(0, args.modo === "detalhado" ? 20 : 5)) {
+        lines.push(`msg: ${formatChatLine(message)}`);
       }
-      lines.push("");
-
-      lines.push("TAREFA ATUAL:");
-      if (!task) {
-        lines.push("  (nenhuma)");
-      } else {
-        lines.push(`  ${task.title} [${task.status}]`);
-        if (lastUpdate) {
-          const t = new Date(lastUpdate.created_at).toISOString().replace("T", " ").slice(0, 19);
-          lines.push(`  último progresso [${t}]: ${lastUpdate.progress}`);
-        }
+      if (args.modo === "detalhado") {
+        for (const handoff of handoffs) lines.push(`handoff: ${handoff.from_name ?? handoff.from_session} -> ${handoff.note}`);
+        for (const conflict of conflicts) lines.push(`conflito: ${conflict.file} <- ${conflict.held_by_name}/${conflict.held_by_role}`);
       }
-      lines.push("");
-
-      lines.push(`WORK ITEMS PARA MIM (${myWorkItems.length}):`);
-      if (!myWorkItems.length) {
-        lines.push("  (nenhum)");
-      } else {
-        for (const w of myWorkItems) {
-          lines.push(`  ${w.id} [${w.status}/${w.priority}] ${w.title}`);
-          if (w.worktree_path) lines.push(`    worktree: ${w.worktree_path}`);
-          if (w.blocked_reason) lines.push(`    bloqueio: ${w.blocked_reason}`);
-        }
-      }
-      lines.push("");
-
-      lines.push(`MEUS LOCKS (${myLocks.length}):`);
-      if (myLocks.length) {
-        for (const l of myLocks) lines.push(`  ✓ ${l.file_path}`);
-      } else {
-        lines.push("  (nenhum)");
-      }
-      if (conflicts.length) {
-        lines.push("");
-        lines.push("CONFLITOS NOS ARQUIVOS PRETENDIDOS:");
-        for (const c of conflicts) lines.push(`  ✗ ${c.file}  ← ${c.held_by_name} [${c.held_by_role}] (${c.status})`);
-      }
-
-      if (isGerente) {
-        lines.push("");
-        lines.push(`EQUIPE OCIOSA (${idleAgents.length}) — candidatos a nova delegação:`);
-        if (!idleAgents.length) {
-          lines.push("  (todos ativos)");
-        } else {
-          for (const a of idleAgents) {
-            lines.push(`  ⚠ ${a.name}/${a.role}  ocioso há ${a.idle_min}min`);
-            if (a.last_summary) lines.push(`    último: ${a.last_summary}`);
-          }
-        }
-      }
-
-      lines.push("");
-      lines.push(`SUGESTÃO: ${suggestion}`);
-      lines.push(`PRÓXIMA CHECAGEM: ${nextDelaySec}s`);
-      lines.push("");
-      if (isGerente && idleAgents.length && suggestion === "AGIR") {
-        lines.push("AÇÃO SUGERIDA: use delegar_tarefa para atribuir trabalho aos agentes ociosos listados acima.");
-      }
-      lines.push("Após agir (ou decidir ficar ocioso), chame marcar_lido para não re-agir nas mesmas mensagens.");
-
+      lines.push(`proximo_tick: ${nextDelaySec}s`);
+      lines.push("politica: decida sozinho o reversível; bloqueie só impedimento externo/irreversível e então puxe outro item.");
       return text(lines.join("\n"));
     },
   },
@@ -2078,7 +2922,7 @@ export const tools: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        cargo: { type: "string", enum: [...ROLES], description: "Cargo do agente a restaurar." },
+        cargo: { type: "string", description: "Papel atual do agente a restaurar (compatibilidade)." },
         pasta: { type: "string", description: "Pasta de trabalho (ajuda a identificar o agente certo se houver múltiplos do mesmo cargo)." },
         preferred_name: { type: "string", description: "Nome do agente, se souber." },
       },
@@ -2165,18 +3009,21 @@ export const tools: ToolDef[] = [
       const since = agent.last_seen_ms || agent.created_at;
       const inbox = db
         .prepare(
-          `SELECT * FROM chat_messages
-           WHERE created_at > ?
+          `SELECT cm.* FROM chat_messages cm
+           WHERE cm.team_key = ? AND created_at > ?
              AND agent_id IS NOT ?
              AND (
                to_target = ? OR to_target = ?
-               OR (role = 'gerente' AND (type = 'alerta' OR to_target IS NULL))
-               OR role = 'dono'
-               OR (? = 'gerente' AND to_target IS NULL AND role NOT IN ('gerente','dono'))
+               OR (
+                 EXISTS (SELECT 1 FROM agents sender WHERE sender.id = cm.agent_id AND sender.authority = 'manager')
+                 AND (type = 'alerta' OR to_target IS NULL)
+               )
+               OR cm.role = 'dono' OR cm.session_id = 'desktop-owner'
+               OR (? = 1 AND to_target IS NULL)
              )
            ORDER BY created_at ASC LIMIT 20`
         )
-        .all(since, agent.id, agent.name, agent.role, agent.role) as any[];
+        .all(agent.team_key, since, agent.id, agent.name, agent.role, isManagerAgent(agent) ? 1 : 0) as any[];
       lines.push("");
       lines.push(`INBOX NÃO LIDO (${inbox.length}):`);
       if (!inbox.length) {
@@ -2222,12 +3069,12 @@ export const tools: ToolDef[] = [
   {
     name: "delegar_tarefa",
     description:
-      "Gerente delega uma tarefa a um agente ou cargo. Posta uma decisão prioritária no chat, que aparece no inbox do destinatário no próximo tick. É assim que o gerente orquestra a equipe sem precisar do usuário.",
+      "Compatibilidade: gerente delega um item individual a um agente ou papel atual. Para listas, use distribuir_tarefas.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string", description: "session_id do gerente." },
-        para: { type: "string", description: "Nome do agente OU cargo (ex: 'Mateus', 'frontend', 'backend')." },
+        para: { type: "string", description: "Nome do agente ou papel atual livre." },
         tarefa: { type: "string", description: "Descrição clara e acionável do que deve ser feito." },
         contexto: { type: "string", description: "Contexto adicional, dependências, critério de aceite." },
         prioridade: { type: "string", enum: ["normal", "alta", "critica"], default: "normal" },
@@ -2237,8 +3084,7 @@ export const tools: ToolDef[] = [
     handler: (args) => {
       const db = getDb();
       const s = requireActiveSession(db, args.session_id);
-      if (s.role !== "gerente") throw new Error("Apenas o gerente pode delegar tarefas.");
-      const ag = getAgentByActiveSession(db, s.id);
+      const ag = getManagerForSession(db, s);
       const ts = now();
 
       db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(ts, s.id);
@@ -2246,23 +3092,22 @@ export const tools: ToolDef[] = [
 
       const prioridade = args.prioridade ?? "normal";
       const targetAgent = getAgentByIdentifier(db, args.para);
-      if (!targetAgent && !ROLES.includes(args.para as any)) {
-        throw new Error(
-          `'para'='${args.para}' não é cargo válido (${ROLES.join(", ")}) nem agente registrado.`
-        );
-      }
       if (targetAgent && targetAgent.status === "archived") {
         throw new Error(`Agente ${targetAgent.name} está arquivado — não dá pra delegar pra ele.`);
+      }
+      if (targetAgent && targetAgent.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error(`Agente ${targetAgent.name} pertence a outra equipe.`);
       }
       const item = createWorkItem(db, {
         title: args.tarefa,
         description: args.contexto ?? null,
         acceptance: "Destinatário entrega via entregar_tarefa com validação executada ou justificativa.",
         priority: prioridade,
+        team_key: teamKeyForSession(s, ag),
         project: s.project ?? null,
         folder: s.folder ?? null,
-        assigned_to: targetAgent ? targetAgent.name : args.para,
-        assigned_role: targetAgent ? targetAgent.role : ROLES.includes(args.para as any) ? args.para : null,
+        assigned_to: targetAgent ? targetAgent.name : null,
+        assigned_role: targetAgent ? targetAgent.role : args.para,
         created_by_session: s.id,
         created_by_agent: ag?.name ?? null,
       });
