@@ -124,6 +124,30 @@ await test("vida: sessão fechada continua rejeitada (fechado é fechado)", asyn
   assert(rejeitou, "sessão fechada aceitou chamada (não pode ressuscitar fechada)");
 });
 
+// ─── painel honesto ──────────────────────────────────────────────────────────
+
+await test("painel: suspeito e morto mostram 'sem notícias há Xmin'", async () => {
+  const pasta = join(TMP, "equipe-honesta");
+  const abre = await call("abrir", { pasta, force_new: true });
+  const sess = grab(abre, "session_id");
+
+  // Suspeito: 2 minutos sem notícias.
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 120_000, sess);
+  const status = await call("listar_status", {});
+  assert(
+    /suspect \(sem notícias há \d+min\)/.test(status),
+    `EQUIPE ATIVA deveria anotar o tempo sem notícias:\n${status}`
+  );
+
+  // Morto: 7 minutos sem notícias; o sweep marca e a lista de agentes anota.
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess);
+  const agentes = await call("listar_agentes", {});
+  assert(
+    /dead \(sem notícias há \d+min\)/.test(agentes),
+    `listar_agentes deveria anotar o tempo sem notícias:\n${agentes}`
+  );
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

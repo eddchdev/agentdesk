@@ -202,6 +202,16 @@ function autoClaimNext(
   return null;
 }
 
+// O sistema não sabe se um processo morreu; só sabe há quanto tempo não tem
+// notícia dele. "dead"/"suspect" secos afirmavam mais do que o sistema sabe
+// (e mentiam para agente que passa 20min só lendo código). A anotação diz o
+// fato observável.
+function anotaSemNoticias(status: string, lastMs: number): string {
+  if (status !== "dead" && status !== "suspect") return status;
+  const min = Math.max(1, Math.round((now() - lastMs) / 60_000));
+  return `${status} (sem notícias há ${min}min)`;
+}
+
 function renderTeamContext(db: Database.Database, teamKey?: string | null): string {
   sweepSessions(db);
   const sessions = db
@@ -216,7 +226,7 @@ function renderTeamContext(db: Database.Database, teamKey?: string | null): stri
     const areas = parseJsonList(s.areas).join(", ") || "—";
     const files = parseJsonList(s.intended_files).join(", ") || "—";
     lines.push(
-      `- ${s.name} [${s.role}] status=${status}
+      `- ${s.name} [${s.role}] status=${anotaSemNoticias(status, s.last_heartbeat)}
     tarefa: ${s.task ?? "—"}
     projeto: ${s.project ?? "—"}  pasta: ${s.folder ?? "—"}
     áreas: ${areas}
@@ -303,7 +313,7 @@ function renderAgents(db: Database.Database, teamKey?: string | null): string {
           | undefined)
       : null;
     const sess = session ? `sessão=${session.name} (${session.status})` : "sessão=—";
-    lines.push(`- ${a.name} [${a.role}] autoridade=${a.authority} status=${a.status}  ${sess}`);
+    lines.push(`- ${a.name} [${a.role}] autoridade=${a.authority} status=${anotaSemNoticias(a.status, a.last_heartbeat)}  ${sess}`);
     if (a.folder) lines.push(`    pasta: ${a.folder}`);
   }
   return lines.join("\n");
@@ -1604,7 +1614,7 @@ export const tools: ToolDef[] = [
           : null;
         const upd = new Date(a.updated_at).toISOString().replace("T", " ").slice(0, 19);
         lines.push(
-          `- ${a.name} [${a.role}] autoridade=${a.authority} status=${a.status} (atualizado ${upd})\n    id: ${a.id}  equipe: ${a.team_key}\n    pasta: ${a.folder || "—"}    projeto: ${a.project || "—"}\n    sessão atual: ${sess ? `${sess.name} (${sess.status})` : "—"}\n    tarefa atual: ${task ? `${task.title} [${task.status}]` : "—"}`
+          `- ${a.name} [${a.role}] autoridade=${a.authority} status=${anotaSemNoticias(a.status, a.last_heartbeat)} (atualizado ${upd})\n    id: ${a.id}  equipe: ${a.team_key}\n    pasta: ${a.folder || "—"}    projeto: ${a.project || "—"}\n    sessão atual: ${sess ? `${sess.name} (${sess.status})` : "—"}\n    tarefa atual: ${task ? `${task.title} [${task.status}]` : "—"}`
         );
       }
       return text(lines.join("\n"));
