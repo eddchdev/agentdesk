@@ -294,6 +294,40 @@ await test("faxina: agente morto há mais de 7 dias é arquivado, não apagado",
   assert(completo.includes(agentId), "arquivado sumiu do histórico (incluir_arquivados)");
 });
 
+// ─── entrada única ───────────────────────────────────────────────────────────
+
+await test("abrir: entrada única traz inbox, equipe, fila, travas e chat numa resposta só", async () => {
+  const pasta = join(TMP, "equipe-entrada");
+  const g = await call("abrir", { pasta, force_new: true });
+  const gSess = grab(g, "session_id");
+  await call("enviar_mensagem", { session_id: gSess, mensagem: "decisão: API usa REST" });
+  await call("travar_arquivos", { session_id: gSess, arquivos: [join(pasta, "src/db.ts")] });
+  await call("distribuir_tarefas", {
+    session_id: gSess,
+    estrategia: "fila",
+    tarefas: [
+      { titulo: "primeira tarefa da fila", papel: "executor" },
+      { titulo: "segunda tarefa da fila", papel: "executor" },
+    ],
+  });
+
+  // Um trabalhador entra com UMA chamada, declarando um arquivo extra.
+  const w = await call("abrir", { pasta, force_new: true, arquivos_pretendidos: [join(pasta, "src", "novo.ts")] });
+  assert(w.includes("decisão: API usa REST"), `entrada sem o chat recente:\n${w}`);
+  assert(/EQUIPE ATIVA/.test(w), "entrada sem a lista da equipe");
+  assert(/WORK ITEMS ESTRUTURADOS/.test(w), "entrada sem a fila de work items");
+  assert(/TRAVAS ATIVAS/.test(w) && w.includes("src/db.ts"), "entrada sem as travas da equipe");
+  assert(/INBOX de/.test(w), "entrada sem inbox");
+  assert(
+    /travas concedidas na entrada/.test(w) && w.includes("novo.ts"),
+    "não travou o arquivo declarado na entrada"
+  );
+
+  // Arquivo já travado por outro é recusado dizendo quem segura.
+  const w2 = await call("abrir", { pasta, force_new: true, arquivos_pretendidos: [join(pasta, "src/db.ts")] });
+  assert(/trava recusada/.test(w2), `deveria recusar a trava em conflito na entrada:\n${w2}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

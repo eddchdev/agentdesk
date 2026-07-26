@@ -501,6 +501,41 @@ function renderInbox(db: Database.Database, agent: AgentRow, since: number): str
   return lines.join("\n");
 }
 
+// Entrada única: o abrir devolve numa resposta só o que o agente antes
+// precisava buscar em listar_status + listar_chat + inbox_agente (com 9
+// agentes numa frente, cada chamada extra de entrada custa caro) e já trava
+// os arquivos declarados.
+function renderContextoEntrada(
+  db: Database.Database,
+  teamKey: string,
+  agent: AgentRow,
+  sessionId: string,
+  arquivos: string[],
+  areas: string[]
+): string {
+  const lines: string[] = [];
+  if (arquivos.length) {
+    const r = acquireLocks(db, sessionId, arquivos, areas[0], { id: agent.id, name: agent.name });
+    if (r.granted.length) {
+      lines.push(`travas concedidas na entrada: ${r.granted.map((g) => g.file).join(", ")}`);
+    }
+    for (const c of r.conflicts) {
+      lines.push(`trava recusada: ${c.file} já está com ${c.held_by_name} [${c.held_by_role}] — NÃO edite antes de travar`);
+    }
+  }
+  lines.push("");
+  lines.push(renderInbox(db, agent, agent.last_seen_ms || agent.created_at));
+  lines.push("");
+  lines.push(renderTeamContext(db, teamKey));
+  lines.push("");
+  lines.push(renderWorkItems(db, teamKey));
+  lines.push("");
+  lines.push(renderLocks(db, teamKey));
+  lines.push("");
+  lines.push(renderRecentChat(db, 8, teamKey));
+  return lines.join("\n");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const tools: ToolDef[] = [
@@ -1241,6 +1276,12 @@ export const tools: ToolDef[] = [
         retomar_agente_id: { type: "string", description: "Opcional para retomar uma identidade conhecida." },
         force_new: { type: "boolean", default: false, description: "Cria novo trabalhador; nunca cria um segundo gerente." },
         tmux_pane: { type: "string", description: "Pane tmux atual, para push do loop auto." },
+        areas: { type: "array", items: { type: "string" }, description: "Áreas/módulos que pretende mexer." },
+        arquivos_pretendidos: {
+          type: "array",
+          items: { type: "string" },
+          description: "Arquivos fora do escopo do work item que devem ser travados já na entrada.",
+        },
       },
     },
     handler: (args) => {
@@ -1251,6 +1292,8 @@ export const tools: ToolDef[] = [
         retomar_agente_id: z.string().optional(),
         force_new: z.boolean().optional().default(false),
         tmux_pane: z.string().optional(),
+        areas: z.array(z.string()).optional().default([]),
+        arquivos_pretendidos: z.array(z.string()).optional().default([]),
       }).parse(args ?? {});
 
       const db = getDb();
@@ -1366,6 +1409,7 @@ export const tools: ToolDef[] = [
               : claimed
                 ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
                 : "proximo_passo: chame tick_autonomo compacto; a fila será assumida automaticamente quando houver item pronto.",
+            renderContextoEntrada(db, teamKey, agent, live.id, p.arquivos_pretendidos, p.areas),
           ].join("\n"));
         }
       }
@@ -1378,6 +1422,8 @@ export const tools: ToolDef[] = [
         tarefa: initialTask,
         projeto: p.projeto || agent.project || "",
         pasta: folder || agent.folder || "",
+        areas: p.areas,
+        arquivos_pretendidos: p.arquivos_pretendidos,
         agent,
         teamKey,
       });
@@ -1421,6 +1467,7 @@ export const tools: ToolDef[] = [
           : claimed
             ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
             : "proximo_passo: rode tick_autonomo compacto; ele assumirá automaticamente o primeiro item pronto.",
+        renderContextoEntrada(db, teamKey, agent, opened.sessionId, p.arquivos_pretendidos, p.areas),
       ].join("\n"));
     },
   },
