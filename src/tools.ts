@@ -210,23 +210,29 @@ function autoClaimNext(
 function resolveTeamScope(db: Database.Database, args: any): string | null {
   if (args?.todas_equipes) return null;
   if (args?.session_id) {
-    try {
-      const session = requireActiveSession(db, args.session_id);
-      return teamKeyForSession(session, getAgentByActiveSession(db, session.id));
-    } catch {
-      // Sessão inválida não deve impedir a leitura; cai para os fallbacks.
+    // Leitura pura, sem efeito colateral: descobrir a equipe NÃO é sinal de
+    // vida do alvo. Um painel ou gerente consultando o session_id de um
+    // agente morto não pode ressuscitá-lo (isso mantinha mortos "vivos" para
+    // sempre). Sessão fechada ainda resolve a equipe dela, que é o escopo
+    // mais preciso que existe.
+    const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(args.session_id) as SessionRow | undefined;
+    if (session) {
+      const agente = session.agent_id ? findAgentById(db, session.agent_id) : null;
+      return teamKeyForSession(session, agente);
     }
   }
-  const pasta = (typeof args?.pasta === "string" && args.pasta.trim())
-    || process.env.AGENTDESK_FOLDER
-    || process.cwd();
-  return deriveTeamKey(pasta, typeof args?.projeto === "string" ? args.projeto : null);
+  const pasta = typeof args?.pasta === "string" && args.pasta.trim() ? args.pasta.trim() : null;
+  const projeto = typeof args?.projeto === "string" && args.projeto.trim() ? args.projeto.trim() : null;
+  // pasta/projeto explícitos ganham do ambiente; sem eles, a equipe é a da
+  // pasta do processo (Claude Code inicia o servidor na pasta do projeto).
+  if (pasta || projeto) return deriveTeamKey(pasta, projeto);
+  return deriveTeamKey(process.env.AGENTDESK_FOLDER || process.cwd(), null);
 }
 
 const ESCOPO_PROPS = {
-  session_id: { type: "string", description: "Escopo preferido: usa a equipe desta sessão (e renova o heartbeat)." },
+  session_id: { type: "string", description: "Escopo preferido: usa a equipe desta sessão (leitura pura, não renova heartbeat)." },
   pasta: { type: "string", description: "Escopo alternativo: pasta da equipe." },
-  projeto: { type: "string", description: "Escopo alternativo: nome do projeto." },
+  projeto: { type: "string", description: "Escopo alternativo: nome do projeto (equipes project:*)." },
   todas_equipes: { type: "boolean", default: false, description: "Mostra todas as equipes (visão global explícita)." },
 } as const;
 

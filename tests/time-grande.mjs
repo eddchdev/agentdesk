@@ -397,6 +397,33 @@ await test("retomada reaproveita a task do mesmo título (sem pilha de in_progre
   assert(/concluída/.test(feito), `marcar_feito falhou: ${feito}`);
 });
 
+// ─── leitura sem efeito colateral ────────────────────────────────────────────
+
+await test("painel: consultar session_id de agente morto NÃO o ressuscita", async () => {
+  const pasta = join(TMP, "equipe-leitura");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-leitura", pasta });
+  const sess = um.match(/\(id=([\w-]+)\)/)?.[1];
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sess);
+  await call("listar_status", { pasta });
+  const antes = rawDb().prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
+  assert(antes.status === "dead", `setup: agente deveria estar dead, está ${antes.status}`);
+
+  // Painel/gerente consultando com o session_id guardado: leitura pura.
+  const visto = await call("listar_status", { session_id: sess });
+  assert(visto.includes(`folder:${pasta}`), `escopo deveria vir da sessão consultada:\n${visto.split("\n")[0]}`);
+  const depois = rawDb().prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
+  const sessRow = rawDb().prepare("SELECT status FROM sessions WHERE id = ?").get(sess);
+  assert(depois.status === "dead", `leitura ressuscitou o agente: ${depois.status}`);
+  assert(sessRow.status === "dead", `leitura ressuscitou a sessão: ${sessRow.status}`);
+});
+
+await test("painel: filtro por projeto alcança equipes project:*", async () => {
+  const r = await call("listar_status", { projeto: "legado-x" });
+  assert(r.includes("EQUIPE: project:legado-x"), `filtro por projeto não resolveu:\n${r.split("\n")[0]}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;
