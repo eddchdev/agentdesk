@@ -59,8 +59,8 @@ export interface HandoffView {
 export interface DelegationView {
   id: string;            // chat_message id
   from_name: string;     // agente que delegou
-  from_role: string;     // cargo (geralmente "gerente")
-  to_target: string;     // destinatário (nome ou cargo)
+  from_role: string;     // papel livre no momento da delegação
+  to_target: string;     // destinatário (nome ou papel atual)
   message: string;       // mensagem completa da delegação
   created_at: number;
   seen: boolean;         // se o alvo já viu (last_seen_ms > created_at)
@@ -105,11 +105,12 @@ export interface Snapshot {
 declare global {
   interface Window {
     agentdesk: {
-      snapshot: () => Promise<Snapshot>;
-      sendMessage: (to: string | null, message: string, type?: string) => Promise<void>;
+      snapshot: (folder?: string) => Promise<Snapshot>;
+      sendMessage: (to: string | null, message: string, type?: string, folder?: string) => Promise<void>;
+      onChanged: (cb: () => void) => () => void;
     };
     terminal: {
-      create: (id: string, name: string, cwd?: string) => Promise<{ ok: boolean }>;
+      create: (id: string, name?: string, cwd?: string) => Promise<{ ok: boolean }>;
       homedir: () => Promise<string>;
       pickDir: () => Promise<string | null>;
       write: (id: string, data: string) => void;
@@ -117,6 +118,7 @@ declare global {
       kill: (id: string) => void;
       onData: (cb: (id: string, data: string) => void) => () => void;
       onExit: (cb: (id: string) => void) => () => void;
+      onIdentity: (cb: (id: string, name: string) => void) => () => void;
     };
   }
 }

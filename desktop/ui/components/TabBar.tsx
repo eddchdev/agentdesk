@@ -2,20 +2,6 @@ import { useRef, useState } from "react";
 import { AgentIcon } from "./AgentIcon";
 import { Tooltip } from "./Tooltip";
 
-const ROLE_COLORS: Record<string, string> = {
-  gerente:  "var(--role-gerente)",
-  frontend: "var(--role-frontend)",
-  backend:  "var(--role-backend)",
-  qa:       "var(--role-qa)",
-  bugs:     "var(--role-bugs)",
-  whatsapp: "var(--role-whatsapp)",
-  dono:     "var(--role-dono)",
-};
-
-function roleColor(name: string) {
-  return ROLE_COLORS[name.toLowerCase()] ?? "var(--text-dim)";
-}
-
 interface Tab { id: string; name: string; }
 
 interface Props {
@@ -23,7 +9,7 @@ interface Props {
   active: string;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
-  onAdd: (name: string) => void;
+  onAdd: (name?: string) => void;
   cwd: string;
   onPickDir: () => void;
 }
@@ -64,8 +50,7 @@ export function TabBar({ tabs, active, onSelect, onClose, onAdd, cwd, onPickDir 
   };
 
   const confirm = () => {
-    const name = newName.trim();
-    if (name) onAdd(name);
+    onAdd(newName.trim() || undefined);
     close();
   };
 
@@ -101,7 +86,7 @@ export function TabBar({ tabs, active, onSelect, onClose, onAdd, cwd, onPickDir 
             </>
           ) : (
             <>
-              <span className="tab-icon" style={{ color: roleColor(tab.name) }}>
+              <span className="tab-icon" style={{ color: "var(--text-dim)" }}>
                 <AgentIcon size={12} />
               </span>
               <span className="tab-label">{tab.name}</span>
@@ -135,7 +120,8 @@ export function TabBar({ tabs, active, onSelect, onClose, onAdd, cwd, onPickDir 
             className={`tab-new-input${inputOpen ? " tab-new-input-open" : ""}`}
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
-            placeholder="cargo (ex: backend)"
+            placeholder="nome opcional do agente"
+            aria-label="Nome opcional do agente ou da aba"
             style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
             tabIndex={inputOpen ? 0 : -1}
             onKeyDown={(e) => {

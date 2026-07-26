@@ -3,16 +3,18 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, basename } from "node:path";
 import { homedir } from "node:os";
 import { watch } from "node:fs";
-import { openDb, snapshot, sendUserMessage } from "./db.js";
+import { DB_PATH, deriveTeamKey, openDb, snapshot, sendUserMessage } from "./db.js";
 import pty from "node-pty";
 
-// Real-time tuning. Antes: poll 1000ms + debounce 5000ms = latência típica
-// 1-5s entre agentes. Agora: poll 250ms + fs.watch (~50ms) + debounce 1500ms
-// = latência tipica <300ms, urgentes <100ms.
+// O fs.watch é o caminho rápido. O polling é apenas uma rede de segurança
+// para filesystems que eventualmente percam um evento, evitando 4 consultas
+// SQLite por segundo enquanto preserva baixa latência no caminho normal.
 const POKE_DEBOUNCE_MS = 1_500;
-const POKE_POLL_MS = 250;
+const POKE_POLL_MS = 2_000;
 const POKE_MSG = "/auto-tick";
-const DB_PATH = process.env.AGENTDESK_DB ?? join(homedir(), ".agentdesk", "agentdesk.db");
+
+app.setName("AgentDesk");
+app.setAppUserModelId("agentdesk");
 
 if (process.platform === "linux") {
   app.commandLine.appendSwitch("enable-features", "UseOzonePlatform,WaylandWindowDecorations");
@@ -30,9 +32,30 @@ const UI_INDEX = join(PROJECT_ROOT, "dist-ui", "index.html");
 const APP_ICON = join(PROJECT_ROOT, "ui", "public", "icon.png");
 
 let mainWindow: BrowserWindow | null = null;
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
+
+app.on("second-instance", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+
 const terminals = new Map<string, any>();
-const ptyByName = new Map<string, string>(); // tab name (role) -> PTY id
+interface TerminalMeta {
+  requestedName: string | null;
+  agentName: string | null;
+  agentId: string | null;
+  role: string | null;
+  teamKey: string;
+}
+const terminalMeta = new Map<string, TerminalMeta>();
 const lastPokeByPty = new Map<string, number>();
+
+function defaultFolder(): string {
+  return process.env.AGENTDESK_FOLDER || process.env.HOME || homedir();
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -49,8 +72,11 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      backgroundThrottling: true,
     },
   });
+
+  mainWindow.webContents.session.setSpellCheckerEnabled(false);
 
   if (DEV_URL) {
     mainWindow.loadURL(DEV_URL);
@@ -65,14 +91,16 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return;
   openDb();
 
-  ipcMain.handle("agentdesk:snapshot", () => snapshot());
-  ipcMain.handle("agentdesk:sendMessage", (_e, to: string | null, message: string, type: string) => {
-    sendUserMessage(to, message, (type as any) ?? "alerta");
+  ipcMain.handle("agentdesk:snapshot", (_e, folder?: string) => snapshot(deriveTeamKey(folder || defaultFolder())));
+  ipcMain.handle("agentdesk:sendMessage", (_e, to: string | null, message: string, type: string, folder?: string) => {
+    sendUserMessage(to, message, (type as any) ?? "alerta", deriveTeamKey(folder || defaultFolder()));
+    mainWindow?.webContents.send("agentdesk:changed");
   });
 
-  ipcMain.handle('terminal:homedir', () => process.env.HOME || '/home/eddch');
+  ipcMain.handle('terminal:homedir', () => defaultFolder());
 
   ipcMain.handle('terminal:pickDir', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
@@ -83,31 +111,39 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0];
   });
 
-  ipcMain.handle('terminal:create', (_e, id: string, name: string, cwd?: string) => {
+  ipcMain.handle('terminal:create', (_e, id: string, name?: string, cwd?: string) => {
     // Spawn zsh that immediately runs claude. When claude exits, drop to interactive zsh.
     // This guarantees claude launches without any timing/detection issues.
     const startupCmd = `claude --dangerously-skip-permissions; exec zsh -i`;
+    const requestedName = name?.trim() || null;
+    const folder = cwd || defaultFolder();
+    const termEnv: Record<string, string | undefined> = {
+      ...process.env,
+      AGENTDESK_FOLDER: folder,
+      HOME: process.env.HOME || homedir(),
+      TERM: 'xterm-256color',
+      STARSHIP_LOG: 'error',
+      STARSHIP_SCAN_TIMEOUT: '50',
+    };
+    if (requestedName) termEnv.AGENTDESK_AGENT = requestedName;
+    else delete termEnv.AGENTDESK_AGENT;
+
     const term = pty.spawn('/bin/zsh', ['-l', '-i', '-c', startupCmd], {
       name: 'xterm-256color',
       cols: 80,
       rows: 24,
-      cwd: cwd || process.env.HOME || '/home/eddch',
-      env: {
-        ...process.env,
-        AGENTDESK_AGENT: name,
-        // Propagado pro MCP server: quando /abrir não passa pasta, o tool usa
-        // essa env como fallback. Evita criar agente duplicado na mesma pasta
-        // só porque a skill esqueceu de incluir o cwd.
-        AGENTDESK_FOLDER: cwd || process.env.HOME || '/home/eddch',
-        HOME: process.env.HOME || '/home/eddch',
-        TERM: 'xterm-256color',
-        STARSHIP_LOG: 'error',
-        STARSHIP_SCAN_TIMEOUT: '50',
-      },
+      cwd: folder,
+      env: termEnv,
     });
 
     terminals.set(id, term);
-    ptyByName.set(name, id);
+    terminalMeta.set(id, {
+      requestedName,
+      agentName: requestedName,
+      agentId: null,
+      role: null,
+      teamKey: deriveTeamKey(folder),
+    });
 
     let abrirSent = false;
     let buf = '';
@@ -120,15 +156,8 @@ app.whenReady().then(() => {
       abrirSent = true;
       buf = '';
       if (abrirFallback) { clearTimeout(abrirFallback); abrirFallback = null; }
-      setTimeout(() => terminals.get(id)?.write(`/abrir ${name}\r`), 1500);
-      // Auto-liga modo autônomo 12s depois do /abrir. Garante que cada tab
-      // já recebe pokes em tempo real sem precisar do usuário digitar /auto.
-      // Atraso de 12s dá tempo do /abrir terminar de criar/retomar agente,
-      // logar contexto e voltar pro prompt idle.
-      setTimeout(() => {
-        const t = terminals.get(id);
-        if (t) t.write(`/auto\r`);
-      }, 12_000);
+      const argument = requestedName ? ` ${requestedName}` : "";
+      setTimeout(() => terminals.get(id)?.write(`/abrir${argument}\r`), 1500);
     };
 
     // Fallback: envia /abrir após 14s caso a detecção de Welcome falhe
@@ -137,12 +166,29 @@ app.whenReady().then(() => {
     term.onData((data: string) => {
       mainWindow?.webContents.send('terminal:data', id, data);
 
-      if (abrirSent) return;
-
       buf += data;
       if (buf.length > 8000) buf = buf.slice(-3000);
 
       const clean = stripAnsi(buf);
+
+      // Tool output gives us the generated identity even when the tab name was
+      // left blank. Binding it here keeps targeted real-time pokes precise.
+      const identity = clean.match(/(?:ABERTO|RETOMADO)\s*[·-]\s*([^/\r\n]+)\/([^\r\n]+)/i);
+      const agentId = clean.match(/agent_id:\s*([^\s\r\n]+)/i);
+      const meta = terminalMeta.get(id);
+      if (meta) {
+        if (identity) {
+          const resolvedName = identity[1].trim();
+          if (!meta.requestedName && meta.agentName !== resolvedName) {
+            mainWindow?.webContents.send('terminal:identity', id, resolvedName);
+          }
+          meta.agentName = resolvedName;
+          meta.role = identity[2].trim();
+        }
+        if (agentId) meta.agentId = agentId[1].trim();
+      }
+
+      if (abrirSent) return;
 
       // Claude Code v2.x mostra "Claude Code vX.Y.Z" + "bypass permissions"
       // Older versions mostravam "Welcome back". Suportar ambos.
@@ -156,7 +202,7 @@ app.whenReady().then(() => {
     term.onExit(() => {
       mainWindow?.webContents.send('terminal:exit', id);
       terminals.delete(id);
-      for (const [k, v] of ptyByName.entries()) if (v === id) ptyByName.delete(k);
+      terminalMeta.delete(id);
       lastPokeByPty.delete(id);
       if (abrirFallback) { clearTimeout(abrirFallback); abrirFallback = null; }
     });
@@ -175,7 +221,7 @@ app.whenReady().then(() => {
   ipcMain.on('terminal:kill', (_e, id: string) => {
     terminals.get(id)?.kill();
     terminals.delete(id);
-    for (const [k, v] of ptyByName.entries()) if (v === id) ptyByName.delete(k);
+    terminalMeta.delete(id);
     lastPokeByPty.delete(id);
   });
 
@@ -202,25 +248,39 @@ function startPokeWatcher() {
   let workCursor: number = (db.prepare("SELECT MAX(updated_at) AS m FROM work_items").get() as any)?.m ?? Date.now();
   let handoffCursor: number = (db.prepare("SELECT MAX(created_at) AS m FROM handoffs").get() as any)?.m ?? Date.now();
 
-  const findTargetPty = (agentName: string | null, agentRole: string | null): string | undefined => {
-    if (agentName && ptyByName.has(agentName)) return ptyByName.get(agentName);
-    if (agentRole && ptyByName.has(agentRole)) return ptyByName.get(agentRole);
-    return undefined;
+  const findTargetPtys = (agentName: string, teamKey: string): Set<string> => {
+    const ptys = new Set<string>();
+    for (const [id, meta] of terminalMeta) {
+      if (meta.teamKey !== teamKey) continue;
+      if (meta.agentName === agentName || meta.requestedName === agentName) {
+        ptys.add(id);
+      }
+    }
+    return ptys;
   };
 
   // Heartbeat passivo: enquanto a aba está aberta, o agente está vivo.
   const keepAlive = () => {
-    if (ptyByName.size === 0) return;
-    const tabNames = Array.from(ptyByName.keys());
-    const placeholders = tabNames.map(() => "?").join(",");
+    if (terminalMeta.size === 0) return;
     try {
-      const rows = db.prepare(
-        `SELECT id, name, role, current_session_id FROM agents
-         WHERE status NOT IN ('archived','dead')
-           AND (name IN (${placeholders}) OR role IN (${placeholders}))`
-      ).all(...tabNames, ...tabNames) as Array<{ id: string; name: string; role: string; current_session_id: string | null }>;
+      const byId = db.prepare(
+        `SELECT id, current_session_id FROM agents
+         WHERE id = ? AND team_key = ? AND status NOT IN ('archived','dead')`
+      );
+      const byName = db.prepare(
+        `SELECT id, current_session_id FROM agents
+         WHERE name = ? AND team_key = ? AND status NOT IN ('archived','dead')`
+      );
       const ts = Date.now();
-      for (const a of rows) {
+      const touched = new Set<string>();
+      for (const meta of terminalMeta.values()) {
+        const a = (meta.agentId
+          ? byId.get(meta.agentId, meta.teamKey)
+          : meta.agentName
+            ? byName.get(meta.agentName, meta.teamKey)
+            : undefined) as { id: string; current_session_id: string | null } | undefined;
+        if (!a || touched.has(a.id)) continue;
+        touched.add(a.id);
         db.prepare("UPDATE agents SET last_heartbeat = ?, updated_at = ? WHERE id = ?").run(ts, ts, a.id);
         if (a.current_session_id) {
           db.prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ? AND status != 'closed'").run(ts, a.current_session_id);
@@ -251,72 +311,106 @@ function startPokeWatcher() {
     }
   };
 
-  // Resolve alvos pra um destinatário (nome de agente OU cargo).
-  // Inclui fallback: nome da TAB (caso agente ainda não registrado).
-  const resolveTargets = (to: string | null, fromAgentId: string | null): Set<string> => {
+  // Resolve nome ou papel livre, sempre dentro da equipe de origem.
+  const resolveTargets = (to: string | null, fromAgentId: string | null, teamKey: string): Set<string> => {
     const ptys = new Set<string>();
     if (!to) return ptys;
     const matches = db.prepare(
       `SELECT id, name, role FROM agents
-       WHERE (name = ? OR role = ?) AND auto_mode = 1 AND status NOT IN ('archived','dead')`
-    ).all(to, to) as Array<{ id: string; name: string; role: string }>;
+       WHERE team_key = ? AND (name = ? OR role = ?)
+         AND auto_mode = 1 AND status NOT IN ('archived','dead')`
+    ).all(teamKey, to, to) as Array<{ id: string; name: string; role: string }>;
     for (const a of matches) {
       if (fromAgentId && a.id === fromAgentId) continue;
-      const pty = findTargetPty(a.name, a.role);
-      if (pty) ptys.add(pty);
+      // The query already expands a free-form role to every matching agent;
+      // binding each result by name avoids waking unrelated peers on name sends.
+      for (const pty of findTargetPtys(a.name, teamKey)) ptys.add(pty);
     }
-    if (ptyByName.has(to)) ptys.add(ptyByName.get(to)!);
+    for (const [id, meta] of terminalMeta) {
+      if (meta.teamKey !== teamKey || (fromAgentId && meta.agentId === fromAgentId)) continue;
+      if (meta.requestedName === to || meta.agentName === to || meta.role === to) ptys.add(id);
+    }
     return ptys;
   };
 
-  const broadcastTargets = (fromAgentId: string | null): Set<string> => {
+  const managerTargets = (teamKey: string, fromAgentId: string | null): Set<string> => {
     const ptys = new Set<string>();
-    const all = db.prepare(
+    const managers = db.prepare(
       `SELECT id, name, role FROM agents
-       WHERE auto_mode = 1 AND status NOT IN ('archived','dead')`
-    ).all() as Array<{ id: string; name: string; role: string }>;
-    for (const a of all) {
-      if (fromAgentId && a.id === fromAgentId) continue;
-      const pty = findTargetPty(a.name, a.role);
-      if (pty) ptys.add(pty);
+       WHERE team_key = ? AND authority = 'manager'
+         AND auto_mode = 1 AND status NOT IN ('archived','dead')`
+    ).all(teamKey) as Array<{ id: string; name: string; role: string }>;
+    for (const manager of managers) {
+      if (fromAgentId && manager.id === fromAgentId) continue;
+      for (const pty of findTargetPtys(manager.name, teamKey)) ptys.add(pty);
+    }
+    return ptys;
+  };
+
+  const peerReviewerTargets = (workItem: { id: string; team_key: string; owner_agent_id: string | null }): Set<string> => {
+    const candidates = db.prepare(
+      `SELECT a.id, a.name
+       FROM agents a
+       WHERE a.team_key = ? AND a.authority = 'worker'
+         AND a.id <> COALESCE(?, '')
+         AND a.auto_mode = 1 AND a.status NOT IN ('archived','dead')
+       ORDER BY EXISTS(
+         SELECT 1 FROM work_items own WHERE own.owner_agent_id = a.id AND own.status = 'working'
+       ) ASC,
+         CASE WHEN a.id >= ? THEN 0 ELSE 1 END ASC,
+         a.id ASC`
+    ).all(workItem.team_key, workItem.owner_agent_id, workItem.id) as Array<{ id: string; name: string }>;
+    for (const candidate of candidates) {
+      const ptys = findTargetPtys(candidate.name, workItem.team_key);
+      if (ptys.size) return new Set([ptys.values().next().value as string]);
+    }
+    return managerTargets(workItem.team_key, workItem.owner_agent_id);
+  };
+
+  const broadcastTargets = (teamKey: string, fromAgentId: string | null): Set<string> => {
+    const ptys = new Set<string>();
+    for (const [id, meta] of terminalMeta) {
+      if (meta.teamKey === teamKey && (!fromAgentId || meta.agentId !== fromAgentId)) ptys.add(id);
     }
     return ptys;
   };
 
   // Drena chat + work_items + handoffs num único tick.
   const drain = () => {
-    if (ptyByName.size === 0) return;
+    if (terminalMeta.size === 0) return;
     try {
       // ─── Chat messages ───────────────────────────────────────────
       const newMsgs = db.prepare(
-        `SELECT id, created_at, agent_id, agent_name, role, type, to_target
-         FROM chat_messages WHERE created_at > ? ORDER BY created_at ASC LIMIT 200`
+        `SELECT cm.id, cm.created_at, cm.session_id, cm.agent_id, cm.agent_name,
+                cm.role, cm.type, cm.to_target, cm.team_key, a.authority
+           FROM chat_messages cm
+           LEFT JOIN agents a ON a.id = cm.agent_id
+          WHERE cm.created_at > ? ORDER BY cm.created_at ASC LIMIT 200`
       ).all(chatCursor) as Array<{
-        id: string; created_at: number; agent_id: string | null;
+        id: string; created_at: number; session_id: string; agent_id: string | null;
         agent_name: string | null; role: string; type: string; to_target: string | null;
+        team_key: string; authority: string | null;
       }>;
 
       for (const m of newMsgs) {
         if (m.created_at > chatCursor) chatCursor = m.created_at;
-        const isDono = m.role === "dono";
-        if (!isDono && !["pedir","passar","alerta","decisao","falar"].includes(m.type)) continue;
+        const fromOwner = m.session_id === "desktop-owner";
+        if (!fromOwner && !["pedir","passar","alerta","decisao","falar"].includes(m.type)) continue;
 
-        const fromManager = m.role === "gerente";
-        const urgent = isDono || m.type === "alerta" || m.type === "passar"
+        const fromManager = m.authority === "manager";
+        const urgent = fromOwner || m.type === "alerta" || m.type === "passar"
           || (fromManager && (m.type === "pedir" || m.type === "decisao" || m.type === "falar"));
 
         let ptys: Set<string>;
         if (m.to_target) {
-          ptys = resolveTargets(m.to_target, m.agent_id);
-        } else if (isDono || (fromManager && (m.type === "alerta" || m.type === "falar" || m.type === "decisao"))) {
-          // Broadcast do dono/gerente: acorda todo o time.
-          ptys = broadcastTargets(m.agent_id);
+          ptys = resolveTargets(m.to_target, m.agent_id, m.team_key);
+        } else if (fromOwner || (fromManager && (m.type === "alerta" || m.type === "falar" || m.type === "decisao"))) {
+          // Broadcast do usuário/coordenação: acorda todo o time.
+          ptys = broadcastTargets(m.team_key, m.agent_id);
         } else if (!fromManager && (m.type === "falar" || m.type === "alerta" || m.type === "decisao")) {
-          // Broadcast de SUBORDINADO: acorda apenas gerentes — pra resposta
-          // subir até a coordenação sem despertar o time inteiro.
-          // Antes: subordinado falando broadcast era ignorado, então quando
-          // backend respondia ao gerente, ninguém acordava → conversa morria.
-          ptys = resolveTargets("gerente", m.agent_id);
+          // Respostas de trabalhadores sobem à autoridade da equipe, sem
+          // depender do texto que estiver em "papel atual".
+          ptys = managerTargets(m.team_key, m.agent_id);
         } else {
           continue;
         }
@@ -325,13 +419,13 @@ function startPokeWatcher() {
 
       // ─── Work items (delegação, blocked, review) ────────────────
       const newItems = db.prepare(
-        `SELECT id, status, priority, assigned_to, assigned_role, owner_agent_id, owner_agent_name, updated_at
+        `SELECT id, status, priority, assigned_to, assigned_role, owner_agent_id, owner_agent_name, updated_at, team_key
          FROM work_items WHERE updated_at > ? ORDER BY updated_at ASC LIMIT 50`
       ).all(workCursor) as Array<{
         id: string; status: string; priority: string;
         assigned_to: string | null; assigned_role: string | null;
         owner_agent_id: string | null; owner_agent_name: string | null;
-        updated_at: number;
+        updated_at: number; team_key: string;
       }>;
 
       for (const w of newItems) {
@@ -340,26 +434,25 @@ function startPokeWatcher() {
         const urgent = w.priority === "critica" || w.priority === "alta" || w.status === "review";
         let ptys: Set<string>;
         if (w.status === "review") {
-          ptys = new Set([
-            ...resolveTargets("qa", null),
-            ...resolveTargets("gerente", null),
-          ]);
+          ptys = peerReviewerTargets(w);
         } else {
           const target = w.assigned_to || w.assigned_role || w.owner_agent_name;
-          ptys = resolveTargets(target, null);
+          ptys = resolveTargets(target, null, w.team_key);
         }
         for (const pty of ptys) pokePty(pty, urgent, `work_item.${w.status}`);
       }
 
       // ─── Handoffs ────────────────────────────────────────────────
       const newHandoffs = db.prepare(
-        `SELECT id, to_target, from_session, created_at
+        `SELECT id, to_target, from_session, created_at, team_key
          FROM handoffs WHERE created_at > ? AND accepted = 0 ORDER BY created_at ASC LIMIT 20`
-      ).all(handoffCursor) as Array<{ id: string; to_target: string; from_session: string; created_at: number }>;
+      ).all(handoffCursor) as Array<{
+        id: string; to_target: string; from_session: string; created_at: number; team_key: string;
+      }>;
 
       for (const h of newHandoffs) {
         if (h.created_at > handoffCursor) handoffCursor = h.created_at;
-        const ptys = resolveTargets(h.to_target, null);
+        const ptys = resolveTargets(h.to_target, null, h.team_key);
         for (const pty of ptys) pokePty(pty, true, `handoff`);
       }
     } catch (e) {
@@ -381,6 +474,7 @@ function startPokeWatcher() {
         pendingDrain = setTimeout(() => {
           pendingDrain = null;
           drain();
+          mainWindow?.webContents.send("agentdesk:changed");
         }, 30);
       }
     });

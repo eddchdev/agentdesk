@@ -9,7 +9,12 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "npm run build && npm run test:e2e && npm run test:autonomia",
+    "test:e2e": "node tests/e2e.mjs",
+    "test:autonomia": "node tests/autonomia.mjs",
+    "test:broker": "node tests/broker.mjs",
+    "test:all": "npm test && npm run test:broker"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

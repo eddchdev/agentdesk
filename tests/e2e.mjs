@@ -19,10 +19,10 @@
 //
 // O test usa apenas a saída isError + texto pra decidir pass/fail.
 
-import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnMcp } from "./helpers/mcp-process.mjs";
 
 const MCP_BIN = resolve(import.meta.dirname, "../dist/index.js");
 const DB_DIR = mkdtempSync(join(tmpdir(), "agentdesk-e2e-"));
@@ -35,12 +35,17 @@ class Client {
     this.nextId = 1;
     this.pending = new Map();
     this.buf = "";
-    this.proc = spawn("node", [MCP_BIN], {
+    this.proc = spawnMcp(MCP_BIN, {
       env: { ...process.env, AGENTDESK_DB: DB_PATH, HOME: DB_DIR },
-      stdio: ["pipe", "pipe", "pipe"],
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk) => this.handleData(chunk));
+    this.proc.on("exit", (code, signal) => {
+      for (const pending of this.pending.values()) {
+        pending.reject(new Error(`${this.label}: MCP encerrou (code=${code}, signal=${signal})`));
+      }
+      this.pending.clear();
+    });
     this.proc.stderr.on("data", (d) => process.stderr.write(`[${label}] ${d}`));
   }
 
@@ -53,6 +58,8 @@ class Client {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
+        // `script` (compatibilidade Node 26) pode ecoar o request.
+        if (!("result" in msg) && !("error" in msg)) continue;
         const p = this.pending.get(msg.id);
         if (p) {
           this.pending.delete(msg.id);
@@ -72,7 +79,7 @@ class Client {
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
-          reject(new Error(`timeout ${method}`));
+          reject(new Error(`${this.label}: timeout ${method}`));
         }
       }, 5000);
     });
@@ -105,7 +112,7 @@ class Client {
   async close() {
     try {
       this.proc.stdin.end();
-      this.proc.kill("SIGTERM");
+      this.proc.kill(this.proc.agentdeskTestPty ? "SIGKILL" : "SIGTERM");
       await new Promise((r) => this.proc.once("exit", r));
     } catch {}
   }
@@ -147,8 +154,11 @@ async function run() {
 
   // Cliente gerente.
   const A = new Client("A");
-  const B = new Client("B");
   await A.initialize();
+  // O primeiro processo cria/migra o DB. Só depois subimos o segundo para a
+  // suíte funcional não falhar por uma race de bootstrap SQLite alheia aos
+  // cenários que ela pretende validar.
+  const B = new Client("B");
   await B.initialize();
 
   // ─── 1. Abrir agente, persiste identidade ─────────────────────────
@@ -186,19 +196,15 @@ async function run() {
 
   // ─── 3. Gerente + delegar pra agente arquivado falha ──────────────
   let gerenteSessId;
-  await test("gerente abre + delegar pra agente inexistente falha", async () => {
-    const r = await A.call("abrir_ou_retornar_agente", {
-      cargo: "gerente", tarefa: "coordenar", pasta: "/tmp/agentdesk-e2e", force_new: true,
+  await test("delegar aceita papel dinâmico ainda sem agente", async () => {
+    const r = await A.call("abrir", {
+      pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     gerenteSessId = extractValue(A.text(r), "session_id");
-    try {
-      await A.call("delegar_tarefa", {
-        session_id: gerenteSessId, para: "NinguemAssimExiste", tarefa: "x",
-      });
-      throw new Error("delegar pra inválido deveria ter falhado");
-    } catch (e) {
-      assert(/não é cargo válido/.test(e.message), `mensagem ruim: ${e.message}`);
-    }
+    const delegated = await A.call("delegar_tarefa", {
+      session_id: gerenteSessId, para: "especialista-seguranca", tarefa: "x",
+    });
+    assert(/work item/i.test(A.text(delegated)), `delegação dinâmica falhou: ${A.text(delegated)}`);
   });
 
   // ─── 4. Race de claim: dois agentes pegam o mesmo work item ──────
@@ -214,7 +220,7 @@ async function run() {
     const C = new Client("C");
     await C.initialize();
     const cR = await C.call("abrir_ou_retornar_agente", {
-      cargo: "backend", tarefa: "rival", pasta: "/tmp/agentdesk-e2e-charlie", force_new: true,
+      cargo: "backend", tarefa: "rival", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const charlieSess = extractValue(C.text(cR), "session_id");
 
@@ -273,7 +279,7 @@ async function run() {
     const E = new Client("E");
     await E.initialize();
     const eR = await E.call("abrir_ou_retornar_agente", {
-      cargo: "backend", tarefa: "intruso", pasta: "/tmp/agentdesk-e2e-e", force_new: true,
+      cargo: "backend", tarefa: "intruso", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const eSess = extractValue(E.text(eR), "session_id");
     try {
@@ -285,6 +291,30 @@ async function run() {
       assert(/Apenas o dono|não encontrado/.test(e.message), `mensagem ruim: ${e.message}`);
     }
     await E.close();
+  });
+
+  await test("isolamento: agente de outra equipe não assume work item", async () => {
+    const created = await A.call("delegar_tarefa", {
+      session_id: gerenteSessId, para: "backend", tarefa: "isolamento entre equipes",
+    });
+    const wid = A.text(created).match(/work item ([^\s:]+)/)?.[1];
+    assert(wid, "work_item_id não veio");
+
+    const OtherTeam = new Client("OtherTeam");
+    await OtherTeam.initialize();
+    const opened = await OtherTeam.call("abrir_ou_retornar_agente", {
+      cargo: "backend", tarefa: "não roubar fila", pasta: "/tmp/agentdesk-outra-equipe", force_new: true,
+    });
+    const otherSession = extractValue(OtherTeam.text(opened), "session_id");
+    try {
+      await OtherTeam.call("assumir_tarefa", {
+        session_id: otherSession, work_item_id: wid, criar_worktree: false, travar: false,
+      });
+      throw new Error("agente cross-team conseguiu assumir item");
+    } catch (error) {
+      assert(/outra equipe/i.test(error.message), `erro não preserva isolamento: ${error.message}`);
+    }
+    await OtherTeam.close();
   });
 
   // ─── 7. Fechar + reabrir mantém identidade ────────────────────────
@@ -375,7 +405,7 @@ async function run() {
     const H = new Client("H");
     await H.initialize();
     const hR = await H.call("abrir_ou_retornar_agente", {
-      cargo: "backend", tarefa: "intruso", pasta: "/tmp/agentdesk-e2e-h", force_new: true,
+      cargo: "backend", tarefa: "intruso", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const hSess = extractValue(H.text(hR), "session_id");
     try {
@@ -413,7 +443,7 @@ async function run() {
     const K = new Client("K");
     await K.initialize();
     const kR = await K.call("abrir_ou_retornar_agente", {
-      cargo: "backend", tarefa: "lock holder", pasta: "/tmp/agentdesk-e2e-k", force_new: true,
+      cargo: "backend", tarefa: "lock holder", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const kSess = extractValue(K.text(kR), "session_id");
     await K.call("travar_arquivos", { session_id: kSess, arquivos: ["/tmp/k-locked.ts"] });
@@ -460,7 +490,7 @@ async function run() {
     const M = new Client("M");
     await M.initialize();
     const r = await M.call("abrir_ou_retornar_agente", {
-      cargo: "frontend", tarefa: "tick test", pasta: "/tmp/agentdesk-e2e-m", force_new: true,
+      cargo: "frontend", tarefa: "tick test", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const mSess = extractValue(M.text(r), "session_id");
     const mName = M.text(r).match(/Agente criado: (\S+)/)?.[1];
@@ -470,23 +500,20 @@ async function run() {
     await A.call("pedir_acao", { session_id: gerenteSessId, destinatario: mName, mensagem: "segunda" });
 
     const tick1 = await M.call("tick_autonomo", { session_id: mSess });
-    assert(/INBOX NOVO \(2\)/.test(M.text(tick1)), "tick não viu 2 mensagens");
+    assert(/inbox:\s*2\b/i.test(M.text(tick1)), `tick não viu 2 mensagens:\n${M.text(tick1)}`);
     await M.call("marcar_lido", { session_id: mSess });
 
     const tick2 = await M.call("tick_autonomo", { session_id: mSess });
-    assert(/INBOX NOVO \(0\)/.test(M.text(tick2)), `tick2 deveria ter 0 msgs, recebeu:\n${M.text(tick2)}`);
+    assert(/inbox:\s*0\b/i.test(M.text(tick2)), `tick2 deveria ter 0 msgs, recebeu:\n${M.text(tick2)}`);
     await M.close();
   });
 
-  // ─── 16. Cargo inválido em abrir ─────────────────────────────────
-  await test("abrir_ou_retornar_agente recusa cargo inválido", async () => {
-    try {
-      await A.call("abrir_ou_retornar_agente", { cargo: "ceo", tarefa: "x" });
-      throw new Error("cargo inválido deveria falhar");
-    } catch (e) {
-      assert(/enum|invalid/i.test(e.message) || e.message.includes("ceo"),
-        `msg ruim: ${e.message}`);
-    }
+  // ─── 16. Papel livre no abrir legado ───────────────────────────────────
+  await test("abrir_ou_retornar_agente aceita papel livre", async () => {
+    const opened = await A.call("abrir_ou_retornar_agente", {
+      cargo: "especialista-risco", tarefa: "x", pasta: "/tmp/agentdesk-e2e-livre", force_new: true,
+    });
+    assert(/Papel: especialista-risco/.test(A.text(opened)), `papel livre não persistiu:\n${A.text(opened)}`);
   });
 
   // ─── 17. restaurar_contexto retorna info correta ─────────────────
@@ -552,7 +579,7 @@ async function run() {
     const R = new Client("R");
     await R.initialize();
     const rR = await R.call("abrir_ou_retornar_agente", {
-      cargo: "qa", tarefa: "race read", pasta: "/tmp/agentdesk-e2e-r", force_new: true,
+      cargo: "qa", tarefa: "race read", pasta: "/tmp/agentdesk-e2e", force_new: true,
     });
     const rSess = extractValue(R.text(rR), "session_id");
     const rName = R.text(rR).match(/Agente criado: (\S+)/)?.[1];
@@ -564,7 +591,7 @@ async function run() {
     await new Promise((r2) => setTimeout(r2, 5));
     const tick = await R.call("tick_autonomo", { session_id: rSess });
     const tickText = R.text(tick);
-    assert(/INBOX NOVO \(1\)/.test(tickText), `tick deveria ver 1:\n${tickText.split("\n").slice(0, 8).join("\n")}`);
+    assert(/inbox:\s*1\b/i.test(tickText), `tick deveria ver 1:\n${tickText.split("\n").slice(0, 8).join("\n")}`);
 
     // Mensagem 2 — chega ENTRE tick e marcar_lido.
     await A.call("pedir_acao", { session_id: gerenteSessId, destinatario: rName, mensagem: "msg 2" });
@@ -572,7 +599,7 @@ async function run() {
     // marcar_lido sem args usa tick_cursor (não now()), preserva msg 2.
     await R.call("marcar_lido", { session_id: rSess });
     const tick2 = await R.call("tick_autonomo", { session_id: rSess });
-    assert(/INBOX NOVO \(1\)/.test(R.text(tick2)),
+    assert(/inbox:\s*1\b/i.test(R.text(tick2)),
       `msg 2 sumiu (cursor avançou demais):\n${R.text(tick2)}`);
     await R.close();
   });

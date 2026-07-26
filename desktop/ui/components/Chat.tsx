@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChatMessageView } from "../types";
+import { currentRole, roleBadgeStyle, roleIconStyle, roleTitle } from "../rolePresentation";
 import { AgentIcon } from "./AgentIcon";
 import { Tooltip } from "./Tooltip";
 
@@ -29,11 +30,6 @@ const TYPE_ICON: Record<string, string> = {
   alerta:  "▲",
   decisao: "✓",
   erro:    "✕",
-};
-
-const ROLE_PT: Record<string, string> = {
-  gerente: "Gerente", backend: "Backend", frontend: "Frontend",
-  bugs: "Bugs", whatsapp: "WhatsApp", qa: "QA", dono: "Dono",
 };
 
 function renderMd(raw: string): string {
@@ -129,9 +125,11 @@ export function Chat({ messages, highlightSessionId, activityCount, showActivity
             className={`msg msg-${m.type}${highlightSessionId && m.session_id === highlightSessionId ? " is-highlight" : ""}`}
           >
             <div className="msg-head">
-              <span className={`agent-icon role-${m.role}`}><AgentIcon size={13} /></span>
+              <span className="agent-icon" style={roleIconStyle(m.role)}><AgentIcon size={13} /></span>
               <span className="msg-author">{m.session_name}</span>
-              <span className={`msg-role role-${m.role}`}>{ROLE_PT[m.role] ?? m.role}</span>
+              <Tooltip label={roleTitle(m.role)} side="top">
+                <span className="msg-role" style={roleBadgeStyle(m.role)}>{currentRole(m.role)}</span>
+              </Tooltip>
               <span className={`msg-type type-${m.type}`}>
                 <span className="msg-type-icon">{TYPE_ICON[m.type] ?? ""}</span>
                 {TYPE_LABEL[m.type] ?? m.type}

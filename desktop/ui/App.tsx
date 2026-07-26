@@ -10,14 +10,15 @@ import { TabBar } from "./components/TabBar";
 import { TerminalPane } from "./components/TerminalPane";
 import { ActivityPanel } from "./components/ActivityPanel";
 
-const POLL_MS = 1500;
+const FALLBACK_POLL_MS = 15_000;
+const CHANGE_DEBOUNCE_MS = 120;
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const timer = useRef<number | null>(null);
+  const refreshInFlight = useRef(false);
+  const nextUnnamedTab = useRef(1);
 
   interface AgentTab { id: string; name: string; }
   const [tabs, setTabs] = useState<AgentTab[]>([]);
@@ -29,26 +30,45 @@ export default function App() {
     window.terminal.homedir().then(setTermCwd);
   }, []);
 
+  useEffect(() => window.terminal.onIdentity((id, name) => {
+    setTabs((prev) => prev.map((tab) => tab.id === id ? { ...tab, name } : tab));
+  }), []);
+
   const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     try {
-      setLoading(true);
-      const s = await window.agentdesk.snapshot();
+      const s = await window.agentdesk.snapshot(termCwd || undefined);
       setSnapshot(s);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      refreshInFlight.current = false;
     }
-  }, []);
+  }, [termCwd]);
 
   useEffect(() => {
-    refresh();
-    timer.current = window.setInterval(() => {
-      if (!document.hidden) refresh();
-    }, POLL_MS);
+    let changeTimer: number | null = null;
+    const refreshSoon = () => {
+      if (document.hidden || changeTimer !== null) return;
+      changeTimer = window.setTimeout(() => {
+        changeTimer = null;
+        void refresh();
+      }, CHANGE_DEBOUNCE_MS);
+    };
+    const onVisibility = () => {
+      if (!document.hidden) void refresh();
+    };
+    const unsubscribe = window.agentdesk.onChanged(refreshSoon);
+    const fallbackTimer = window.setInterval(onVisibility, FALLBACK_POLL_MS);
+    document.addEventListener("visibilitychange", onVisibility);
+    void refresh();
     return () => {
-      if (timer.current) window.clearInterval(timer.current);
+      unsubscribe();
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(fallbackTimer);
+      if (changeTimer !== null) window.clearTimeout(changeTimer);
     };
   }, [refresh]);
 
@@ -67,17 +87,19 @@ export default function App() {
       const name = s.agent_name ?? s.name;
       if (!seen.has(name)) {
         seen.add(name);
-        const role = s.role ? ` · ${s.role}` : "";
+        const role = s.role ? ` · papel atual: ${s.role}` : "";
         agents.push({ label: `${name}${role}`, value: name });
       }
     }
     return [{ label: "Todos", value: "__all__" }, ...agents];
   }, [snapshot]);
 
-  const addTab = useCallback(async (name: string) => {
+  const addTab = useCallback(async (name?: string) => {
     const id = `term-${Date.now()}`;
-    await window.terminal.create(id, name, termCwd || undefined);
-    setTabs((prev) => [...prev, { id, name }]);
+    const requestedName = name?.trim() || undefined;
+    const label = requestedName || `Agente ${nextUnnamedTab.current++}`;
+    await window.terminal.create(id, requestedName, termCwd || undefined);
+    setTabs((prev) => [...prev, { id, name: label }]);
     setActiveTab(id);
   }, [termCwd]);
 
@@ -158,13 +180,15 @@ export default function App() {
           />
         </div>
       )}
-      {recipients.length > 0 && <Composer recipients={recipients} onSent={refresh} />}
+      {recipients.length > 0 && (
+        <Composer recipients={recipients} teamFolder={termCwd || undefined} onSent={refresh} />
+      )}
       <div className="footer">
         {selected ? (
           <>
             <strong>{selected.agent_name ?? selected.name}</strong>
             <span className="dim">·</span>
-            <span className="dim">{selected.role}</span>
+            <span className="dim">papel atual: {selected.role || "não definido"}</span>
             <span className="dim">·</span>
             <span className="footer-task">{selected.task ?? "(sem tarefa)"}</span>
             {selected.folder && <span className="dim" style={{ flexShrink: 0 }} title={selected.folder}>{selected.folder.split("/").slice(-2).join("/")}</span>}

@@ -1,9 +1,22 @@
 import Database from "better-sqlite3";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { existsSync } from "node:fs";
 
-const DB_PATH = join(homedir(), ".agentdesk", "agentdesk.db");
+// Keep the desktop connected to the same database as the MCP server. This is
+// especially important for isolated teams/tests that use an explicit DB.
+export const DB_PATH = process.env.AGENTDESK_DB ?? join(homedir(), ".agentdesk", "agentdesk.db");
+
+export function deriveTeamKey(folder?: string | null, project?: string | null): string {
+  const rawFolder = folder?.trim();
+  if (rawFolder) {
+    const path = normalize(rawFolder).replace(/\/+$/, "") || "/";
+    return `folder:${path}`;
+  }
+  const rawProject = project?.trim();
+  if (rawProject) return `project:${rawProject.toLocaleLowerCase()}`;
+  return "default";
+}
 
 // Espelha src/lifecycle.ts — ver comentário lá sobre OCIOSO=300s.
 const SUSPECT_AFTER_MS = 90_000;
@@ -26,17 +39,22 @@ export function openDb(): Database.Database {
 
 const OWNER_SESSION_ID = "desktop-owner";
 const OWNER_SESSION_NAME = "Eduardo";
-const OWNER_ROLE = "dono";
+const OWNER_ROLE = process.env.AGENTDESK_OWNER_ROLE ?? "usuário";
 
-export function sendUserMessage(to: string | null, message: string, type: "alerta" | "pedir" | "decisao" = "alerta"): void {
+export function sendUserMessage(
+  to: string | null,
+  message: string,
+  type: "falar" | "alerta" | "pedir" | "decisao" = "alerta",
+  teamKey = "default"
+): void {
   const d = openDb();
   const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const ts = Date.now();
   d.prepare(
     `INSERT INTO chat_messages
-     (id, created_at, session_id, session_name, role, type, to_target, task_id, files, message, agent_id, agent_name)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)`
-  ).run(id, ts, OWNER_SESSION_ID, OWNER_SESSION_NAME, OWNER_ROLE, type, to, message);
+     (id, created_at, session_id, session_name, role, type, to_target, task_id, files, message, agent_id, agent_name, team_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, ?)`
+  ).run(id, ts, OWNER_SESSION_ID, OWNER_SESSION_NAME, OWNER_ROLE, type, to, message, teamKey);
 }
 
 export interface SessionView {
@@ -162,7 +180,7 @@ function parseList(s: string | null): string[] {
   }
 }
 
-export function snapshot(): Snapshot {
+export function snapshot(teamKey = "default"): Snapshot {
   const d = openDb();
   const now = Date.now();
 
@@ -176,7 +194,7 @@ export function snapshot(): Snapshot {
                   ORDER BY last_heartbeat DESC
                 ) AS rn
          FROM sessions
-         WHERE status != 'closed'
+         WHERE status != 'closed' AND team_key = ?
        )
        SELECT id, name, agent_name, role, task, project, folder, areas, intended_files,
               opened_at, last_heartbeat, status, closed_at
@@ -184,7 +202,7 @@ export function snapshot(): Snapshot {
        WHERE rn = 1
        ORDER BY last_heartbeat DESC`
     )
-    .all() as Array<{
+    .all(teamKey) as Array<{
     id: string;
     name: string;
     agent_name: string | null;
@@ -220,9 +238,12 @@ export function snapshot(): Snapshot {
 
   const chatRows = d
     .prepare(
-      "SELECT id, created_at, session_id, session_name, role, type, to_target, task_id, files, message FROM chat_messages ORDER BY created_at DESC LIMIT 200"
+      `SELECT id, created_at, session_id, session_name, role, type, to_target, task_id, files, message
+         FROM chat_messages
+        WHERE team_key = ?
+        ORDER BY created_at DESC LIMIT 200`
     )
-    .all() as Array<{
+    .all(teamKey) as Array<{
     id: string;
     created_at: number;
     session_id: string;
@@ -257,11 +278,11 @@ export function snapshot(): Snapshot {
          FROM locks l
          JOIN sessions s ON s.id = l.session_id
          LEFT JOIN tasks t ON t.session_id = l.session_id AND t.status = 'in_progress'
-        WHERE l.released_at IS NULL
+        WHERE l.released_at IS NULL AND s.team_key = ?
         GROUP BY l.id
         ORDER BY l.created_at DESC`
     )
-    .all() as Array<{
+    .all(teamKey) as Array<{
     id: string;
     session_id: string;
     session_name: string;
@@ -283,10 +304,11 @@ export function snapshot(): Snapshot {
          FROM handoffs h
          LEFT JOIN sessions s ON s.id = h.from_session
          LEFT JOIN tasks t ON t.id = h.task_id
+        WHERE h.team_key = ?
         ORDER BY h.created_at DESC
         LIMIT 20`
     )
-    .all() as Array<{
+    .all(teamKey) as Array<{
     id: string;
     from_session: string;
     from_name: string | null;
@@ -304,7 +326,7 @@ export function snapshot(): Snapshot {
     accepted: r.accepted === 1,
   }));
 
-  // Delegações: mensagens de chat tipo "decisao" do gerente com to_target, últimas 24h
+  // Delegações: autoridade é estrutural; o papel exibido é texto livre.
   const delegationCutoff = now - 24 * 60 * 60 * 1000;
   const delegationRows = d
     .prepare(
@@ -312,14 +334,16 @@ export function snapshot(): Snapshot {
               COALESCE(cm.agent_name, cm.session_name) AS from_name,
               cm.role AS from_role
          FROM chat_messages cm
+         JOIN agents sender ON sender.id = cm.agent_id
         WHERE cm.type = 'decisao'
-          AND cm.role = 'gerente'
+          AND sender.authority = 'manager'
+          AND cm.team_key = ?
           AND cm.to_target IS NOT NULL
           AND cm.created_at > ?
         ORDER BY cm.created_at DESC
         LIMIT 20`
     )
-    .all(delegationCutoff) as Array<{
+    .all(teamKey, delegationCutoff) as Array<{
     id: string; created_at: number; to_target: string; message: string;
     from_name: string; from_role: string;
   }>;
@@ -327,11 +351,11 @@ export function snapshot(): Snapshot {
   // Para cada delegação, checar se o destinatário já viu (last_seen_ms > created_at)
   const seenCheck = d.prepare(
     `SELECT MAX(last_seen_ms) AS m FROM agents
-      WHERE (name = ? OR role = ?) AND status NOT IN ('archived','dead')`
+      WHERE team_key = ? AND (name = ? OR role = ?) AND status NOT IN ('archived','dead')`
   );
 
   const delegations: DelegationView[] = delegationRows.map((r) => {
-    const ls = (seenCheck.get(r.to_target, r.to_target) as { m: number | null } | undefined)?.m ?? 0;
+    const ls = (seenCheck.get(teamKey, r.to_target, r.to_target) as { m: number | null } | undefined)?.m ?? 0;
     return {
       id: r.id,
       from_name: r.from_name,
@@ -352,11 +376,11 @@ export function snapshot(): Snapshot {
           `SELECT id, title, status, priority, assigned_to, assigned_role, owner_agent_name,
                   blocked_reason, delivery_summary, worktree_path, branch_name, updated_at
              FROM work_items
-            WHERE status NOT IN ('done','canceled')
+            WHERE status NOT IN ('done','canceled') AND team_key = ?
             ORDER BY updated_at DESC
             LIMIT 30`
         )
-        .all() as WorkItemView[])
+        .all(teamKey) as WorkItemView[])
     : [];
 
   // Activities: o que cada agente em sessão ativa está fazendo, em linguagem natural.
@@ -373,6 +397,7 @@ export function snapshot(): Snapshot {
              FROM agents a
              INNER JOIN sessions s ON s.id = a.current_session_id
             WHERE a.status NOT IN ('archived','dead','paused')
+              AND a.team_key = ?
               AND s.status != 'closed'
             ORDER BY s.last_heartbeat DESC
             LIMIT 12`
@@ -381,11 +406,12 @@ export function snapshot(): Snapshot {
              FROM agents a
              INNER JOIN sessions s ON s.id = a.current_session_id
             WHERE a.status NOT IN ('archived','dead','paused')
+              AND a.team_key = ?
               AND s.status != 'closed'
             ORDER BY s.last_heartbeat DESC
             LIMIT 12`
     )
-    .all() as Array<{
+    .all(teamKey) as Array<{
     agent_name: string;
     role: string;
     progress_summary: string | null;

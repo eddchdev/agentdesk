@@ -177,17 +177,17 @@ export function releaseLocks(
   return { released: rows.map((r) => r.file_path) };
 }
 
-export function activeLocks(db: Database.Database, limit = 100): Array<LockRow & { session_name: string; session_role: string }> {
+export function activeLocks(db: Database.Database, limit = 100, teamKey?: string | null): Array<LockRow & { session_name: string; session_role: string }> {
   return db
     .prepare(
       `SELECT l.*, s.name as session_name, s.role as session_role
        FROM locks l
        JOIN sessions s ON s.id = l.session_id
-       WHERE l.released_at IS NULL
+       WHERE l.released_at IS NULL AND (? IS NULL OR s.team_key = ?)
        ORDER BY l.created_at DESC
        LIMIT ?`
     )
-    .all(limit) as any;
+    .all(teamKey ?? null, teamKey ?? null, limit) as any;
 }
 
 export function detectConflicts(db: Database.Database, sessionId: string, files: string[]): {

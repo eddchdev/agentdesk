@@ -1,109 +1,95 @@
-# AgentDesk — regras globais para qualquer Claude da equipe
+# AgentDesk — protocolo autônomo de equipe
 
-Estas regras valem para **toda sessão** do Claude Code conectada ao MCP `agentdesk`.
+Estas regras valem para toda sessão conectada ao MCP `agentdesk`.
 
-## Conceito-chave: AGENTE vs SESSÃO
+## Entrada única
 
-- **Agente**: identidade persistente (ex: "Jonathan/frontend"). Tem nome humano, cargo, pasta, histórico, status, personalidade. Sobrevive ao fechamento do Claude.
-- **Sessão**: execução runtime atual desse agente. Tem `session_id`, heartbeat, travas. Quando você fecha o Claude, a sessão morre — mas o agente continua existindo (status `paused` ou `dead`).
-- Ao reabrir, você **retoma o mesmo agente** (mesmo nome, mesmo histórico), em vez de virar Frontend-02, Frontend-03, etc.
+1. Toda janela nova começa chamando `abrir`, sem escolher cargo nem tarefa.
+2. O primeiro agente de cada pasta/equipe é eleito gerente único.
+3. Os seguintes entram como trabalhadores `disponivel`.
+4. `abrir` já liga `auto_mode`, restaura a identidade quando possível e tenta assumir o próximo work item pronto.
+5. Guarde `session_id` e siga `proximo_passo`. Não peça ao usuário para chamar `/auto` separadamente.
 
-## Comandos disponíveis
+O usuário ainda precisa abrir as janelas/terminais. O AgentDesk coordena agentes existentes; ele não cria processos Claude sozinho.
 
-| Comando | Ferramenta MCP | O que faz |
-|---|---|---|
-| `/abrir` | `abrir_ou_retornar_agente` | Onboarding: retoma agente compatível ou cria um novo com nome persistente. |
-| `/agentes` | `listar_agentes` | Lista todos os agentes da equipe. |
-| `/retomar <nome>` | `retomar_agente` | Retoma um agente específico. |
-| `/inbox` | `inbox_agente` | Mostra pedidos/alertas/handoffs pendentes pro agente atual. |
-| `/status` | `listar_status` | Agentes + sessões ativas + travas + chat. |
-| `/falar <msg>` | `enviar_mensagem` | Mensagem geral no chat. |
-| `/pedir <quem> <msg>` | `pedir_acao` | Pedido direcionado (por nome do agente OU cargo). |
-| `/passar <quem> <nota>` | `passar_tarefa` | Handoff de tarefa. |
-| `/travar <arquivos>` | `travar_arquivos` | Trava arquivos antes de editar. |
-| `/atualizar <progresso>` | `atualizar_progresso` | Registra progresso curto. |
-| `/feito <resumo>` | `marcar_feito` | Conclui tarefa, libera travas. |
-| `/pausar [motivo]` | `pausar_agente` | Pausa o agente (sessão fecha, agente continua). |
-| `/fechar [motivo]` | `fechar_sessao` | Encerra sessão; agente vai pra `paused`. |
-| `/auto` | `entrar_modo_auto` + `/loop /auto-tick` | Entra em modo autônomo (self-paced). |
-| `/sair-auto` | `entrar_modo_auto` (ligar=false) | Sai do modo autônomo. |
-| — | `criar_tarefa_estruturada` | Cria work item com dono/alvo, escopos, dependências e aceite. |
-| — | `listar_tarefas_estruturadas` | Lista fila estruturada por status/agente/cargo. |
-| — | `assumir_tarefa` | Assume work item, trava escopos e cria worktree isolada. |
-| — | `bloquear_tarefa` | Marca work item bloqueado com motivo concreto. |
-| — | `entregar_tarefa` | Entrega work item para review com validação. |
-| — | `revisar_tarefa` | QA/gerente aprova ou reprova work item. |
-| — | `tick_autonomo`, `marcar_lido` | Usados pelo loop interno. |
-| — | `heartbeat`, `listar_chat`, `listar_contexto_time`, `detectar_conflitos` | Auxiliares. |
+## Autoridade e papel são coisas diferentes
 
-## Modo autônomo (`/auto`)
+- `authority=manager` é uma capacidade protegida, eleita uma vez por equipe.
+- `role` é apenas o papel atual, texto livre atribuído pelo gerente conforme o trabalho.
+- Não existe catálogo de cargos.
+- Um trabalhador com papel chamado `gerente` continua trabalhador e não recebe privilégios.
+- Use `atribuir_papel` somente quando precisar trocar o papel fora da distribuição normal.
 
-Quando você roda `/auto`, o Claude entra em loop self-paced. Cada tick:
+## Fluxo do gerente
 
-1. Chama `tick_autonomo` — recebe inbox novo + handoffs + estado da tarefa + sugestão (AGIR/AGUARDAR/OCIOSO) e delay (30s/60s/120s/300s).
-2. Age conforme a sugestão (responde alerta, continua tarefa, escala pro usuário).
-3. Chama `marcar_lido` pra não re-agir nas mesmas mensagens.
-4. Agenda próximo wakeup com `ScheduleWakeup` usando o delay sugerido.
+Quando o usuário fornecer uma lista ou objetivo composto:
 
-Em paralelo, o **watcher externo** (`scripts/agentdesk-watcher.mjs`) assiste o DB e, quando entra mensagem direcionada a um agente em auto com `tmux_pane`, faz `tmux send-keys` na pane dele pra acelerar o próximo tick. Watcher é opcional — sem ele o loop ainda funciona, só com latência igual ao delay configurado.
+1. Decomponha em itens independentes, pequenos o bastante para execução paralela.
+2. Defina `chave`, `titulo`, `papel`, aceite, escopos de arquivo e apenas dependências reais.
+3. Chame `distribuir_tarefas` uma única vez com o lote completo.
+4. Use `estrategia=balanceada` por padrão; `especialidade` quando papéis existentes importarem; `fila` quando agentes ainda não estiverem abertos.
+5. Não microgerencie decisões locais. Monitore somente bloqueios, integração e prioridade.
+6. Revisões são assíncronas e podem ser feitas por qualquer par da equipe que não seja o autor.
 
-## Estados do agente
-`available` → ainda nunca foi usado nessa execução · `working` → tem sessão ativa agora · `paused` → fechou sessão limpo, pronto pra retomar · `dead` → sessão morreu sem fechar · `archived` → removido da equipe.
+Dependências dentro do lote usam a `chave` do item. IDs existentes também são aceitos. Para uma nota que não bloqueia, prefixe com `nota:`.
 
-## As 10 regras duras + autonomia
+## Fluxo do trabalhador
 
-1. **Nunca codar antes de `/abrir`.** Toda janela nova começa com `abrir_ou_retornar_agente`. Se já existe agente compatível (mesmo cargo + mesma pasta), você **DEVE retomá-lo** — não crie identidade nova sem necessidade.
+Cada pulso chama `tick_autonomo` no modo `compacto`:
 
-2. **Antes de trabalhar, leia o INBOX.** O `/abrir` já te entrega o inbox. Releia com `/inbox` sempre que voltar de uma pausa longa.
-   - Se houver **alerta CRÍTICO do gerente**, pare tudo e obedeça antes de continuar a tarefa.
-   - Se houver **handoff pendente** pro seu cargo/nome, considere aceitar antes de pegar trabalho novo.
+- O MCP lê apenas deltas do inbox.
+- Assume atomicamente o próximo item pronto destinado ao agente/papel.
+- Adota o papel escolhido pelo gerente.
+- Trava os escopos e prepara uma worktree automaticamente quando possível.
+- Retorna uma única `acao` e o contexto necessário do item.
 
-3. **Antes de editar um arquivo, use `/travar`.** Lock cooperativo: o MCP grava `agent_id` + `agent_name` na trava, então fica claro quem está mexendo mesmo se a sessão morrer.
-   - Pode travar escopos: `api/**`, `src/painel/**/*.tsx`, `bot/src/routes/*`.
-   - Escopos sobrepostos conflitam automaticamente: `api/**` bloqueia `api/src/index.ts`.
+Ao receber `EXECUTAR`:
 
-4. **Se o arquivo estiver travado por outro agente ativo, PARE.** Use `/pedir <agente> "preciso editar X, libera?"`. Nunca tente "só dar uma olhada e desistir".
+1. Trabalhe na `worktree` retornada, se houver.
+2. Decida sozinho tudo que for reversível e estiver dentro do aceite.
+3. Registre progresso apenas em marcos úteis, não a cada passo.
+4. Valide com build/test/check proporcional ao risco.
+5. Chame `entregar_tarefa`; o item vai para revisão assíncrona e o próximo item pronto é assumido sem espera.
 
-5. **Heartbeat implícito.** Toda chamada de ferramenta atualiza heartbeat da sessão E do agente. Se ficar mais de 2 minutos trabalhando sem chamar nenhuma ferramenta, chame `heartbeat` ou `atualizar_progresso` explicitamente.
+Ao encontrar impedimento real, chame `bloquear_tarefa` com causa concreta. Locks são liberados, o gerente é avisado e outro item pronto é puxado imediatamente.
 
-6. **Para envolver outro cargo, use `/pedir` ou `/passar`.** O destinatário pode ser:
-   - Nome do agente: `Jonathan`, `Marta` (vai direto pra inbox dele)
-   - Cargo: `backend`, `qa` (vai pra inbox de TODOS desse cargo)
-   - Para trabalho real com mais de um arquivo, prefira `criar_tarefa_estruturada` ou `delegar_tarefa`; `delegar_tarefa` agora cria um work item automaticamente.
+## Política de decisão sem gargalo
 
-7. **Decisões pequenas e reversíveis: você decide sozinho.** Não pergunte ao usuário se vai criar `tmp/x.ts`, se vai usar `useMemo`, etc.
-   **Decisões estruturais ou irreversíveis: peça ao gerente.** Mudança de schema, nova dependência, refactor amplo, restart de bot WhatsApp, etc.
+Decida sem consultar o gerente quando a decisão for local, reversível e coberta pelo aceite, incluindo estrutura interna, nomes, pequenos refactors e escolha de teste.
 
-8. **Ao terminar parte importante, use `/atualizar`.** Progresso curto (1-3 linhas) para a equipe acompanhar.
+Escale somente quando houver pelo menos uma destas condições:
 
-9. **Ao finalizar a tarefa, use `/feito`.** Marca tarefa, libera travas, registra resumo no chat.
-   - Se a tarefa veio como work item, use `entregar_tarefa` com `resumo` e `validacao`. QA/gerente fecha com `revisar_tarefa`.
+- ação externa ou irreversível;
+- mudança de contrato público, schema destrutivo ou dependência nova de alto impacto;
+- escopo conflitante que não pode ser isolado;
+- credencial, autorização ou informação essencial ausente;
+- duas interpretações que mudariam materialmente o produto.
 
-10. **Antes de fechar a janela, use `/fechar` ou `/pausar`.** Sem isso, sua sessão fica como `dead` em 3min e suas travas são liberadas automaticamente — mas suas tarefas em andamento entram em estado `pending` sem contexto pra quem assumir.
+Ao escalar, envie uma mensagem curta com evidência, impacto e recomendação. Enquanto aguarda, execute outro item pronto.
 
-## Work items e worktrees
+## Concorrência e economia de tokens
 
-Quando houver paralelismo real, use work items estruturados em vez de só chat:
+- Prefira `distribuir_tarefas` a várias chamadas de `delegar_tarefa`.
+- Use `tick_autonomo(modo="compacto")`; peça `detalhado` só para diagnóstico.
+- Não repita contexto já salvo no work item.
+- Divida por escopos que não se sobrepõem; declare `arquivos_ou_escopos` no lote.
+- Não consulte status em loop enquanto está executando código.
+- Mensagens internas devem ter resultado, risco e próximo passo em poucas linhas.
+- Se a fila estiver vazia, fique ocioso sem inventar trabalho nem solicitar decisão.
 
-1. Gerente cria/delega a tarefa (`criar_tarefa_estruturada` ou `delegar_tarefa`).
-2. Agente chama `assumir_tarefa`.
-3. O MCP tenta travar `arquivos_ou_escopos` e criar uma worktree em `/tmp/agentdesk-worktrees`.
-4. Agente trabalha na worktree/branch informada.
-5. Agente chama `entregar_tarefa` com validação executada.
-6. QA ou gerente chama `revisar_tarefa`.
+## Tools principais
 
-Se `assumir_tarefa` apontar conflito de lock, não edite. O work item vai para `blocked` com o motivo.
+| Objetivo | Tool |
+|---|---|
+| Entrar/retomar e ligar auto | `abrir` |
+| Distribuir uma lista em paralelo | `distribuir_tarefas` |
+| Trocar papel livre | `atribuir_papel` |
+| Pulso e auto-claim | `tick_autonomo` |
+| Progresso útil | `atualizar_progresso` |
+| Entregar e puxar próximo | `entregar_tarefa` |
+| Bloquear e puxar próximo | `bloquear_tarefa` |
+| Revisão por par | `revisar_tarefa` |
+| Mensagem direcionada | `pedir_acao` |
+| Fechar corretamente | `fechar_sessao` ou `pausar_agente` |
 
-## Boas práticas de chat
-
-- 1 linha por mensagem. Resultado, decisão, próximo passo.
-- Tipos: `falar` (geral), `pedir` (assinala alguém), `passar` (handoff), `alerta` (risco), `decisao` (registro), `erro` (incidente).
-- Mensagens aparecem como `[2026-06-16 02:34:09] Jonathan/frontend: ...` (com nome do agente, não com `AgentDesk-Frontend-01`).
-- Se a mensagem virou parágrafo, faça `/atualizar` em vez de `/falar`.
-
-## Cargos
-Detalhes em `.claude/roles/*.md`: `gerente`, `backend`, `frontend`, `bugs`, `whatsapp`, `qa`.
-
-## Compatibilidade
-
-A ferramenta legada `abrir_sessao` continua funcionando — agora ela também cria um agente novo por baixo dos panos. Mas prefira sempre `abrir_ou_retornar_agente` (via `/abrir`).
+As tools `abrir_ou_retornar_agente`, `abrir_sessao` e `delegar_tarefa` continuam disponíveis para clientes antigos. Novos fluxos devem usar `abrir` e `distribuir_tarefas`.

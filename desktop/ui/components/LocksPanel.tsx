@@ -55,7 +55,7 @@ export function LocksPanel({ locks, handoffs, delegations, workItems, highlightS
               </Tooltip>
               <div className="lock-meta">
                 <span className="lock-author">{l.session_name}</span>
-                <span className="dim">{l.role}</span>
+                <span className="dim">papel atual: {l.role || "não definido"}</span>
                 {l.area && (
                   <Tooltip label={`Área: ${l.area}`} side="top">
                     <span className="lock-area">{l.area}</span>

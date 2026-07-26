@@ -28,6 +28,7 @@ export interface Notify {
   to?: string | null;            // nome do agente OU cargo OU null (broadcast)
   from_agent_id?: string | null; // pra não acordar o autor
   from_role?: string | null;     // role do remetente (pra urgência: gerente pedir/decisao)
+  team_key?: string | null;      // impede acordar agentes de outro projeto
   urgent?: boolean;
   priority?: string;
   message_id?: string;

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Tooltip } from "./Tooltip";
 
 interface Recipient { label: string; value: string; }
-interface Props { recipients: Recipient[]; onSent: () => void; }
+interface Props { recipients: Recipient[]; teamFolder?: string; onSent: () => void; }
 
 const TYPE_OPTS = [
   { value: "falar",   label: "Fala",    icon: "◉" },
@@ -11,7 +11,7 @@ const TYPE_OPTS = [
   { value: "decisao", label: "Decisão", icon: "✓" },
 ];
 
-export function Composer({ recipients, onSent }: Props) {
+export function Composer({ recipients, teamFolder, onSent }: Props) {
   const [to, setTo]           = useState("__all__");
   const [type, setType]       = useState("falar");
   const [message, setMessage] = useState("");
@@ -23,7 +23,7 @@ export function Composer({ recipients, onSent }: Props) {
     if (!text || sending) return;
     setSending(true);
     try {
-      await window.agentdesk.sendMessage(to === "__all__" ? null : to, text, type);
+      await window.agentdesk.sendMessage(to === "__all__" ? null : to, text, type, teamFolder);
       setMessage("");
       onSent();
       inputRef.current?.focus();

@@ -1,29 +1,10 @@
 import type { ActivityView } from "../types";
+import { currentRole, roleIconStyle, roleTitle } from "../rolePresentation";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
   activities: ActivityView[];
 }
-
-const ROLE_LABELS: Record<string, string> = {
-  gerente:  "Gerente",
-  frontend: "Frontend",
-  backend:  "Backend",
-  qa:       "QA",
-  bugs:     "Bugs",
-  whatsapp: "WhatsApp",
-  dono:     "Dono",
-};
-
-const ROLE_COLORS: Record<string, string> = {
-  gerente:  "var(--role-gerente)",
-  frontend: "var(--role-frontend)",
-  backend:  "var(--role-backend)",
-  qa:       "var(--role-qa)",
-  bugs:     "var(--role-bugs)",
-  whatsapp: "var(--role-whatsapp)",
-  dono:     "var(--role-dono)",
-};
 
 function formatTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -52,11 +33,11 @@ export function ActivityPanel({ activities }: Props) {
               className={`activity-row activity-${a.status}`}
             >
               <div className="activity-head">
-                <span className="activity-icon" style={{ color: ROLE_COLORS[a.role] ?? "var(--text-muted)" }}>
+                <span className="activity-icon" style={roleIconStyle(a.role)}>
                   <AgentIcon size={14} />
                 </span>
                 <span className="activity-name">{a.agent_name}</span>
-                <span className="activity-role">{ROLE_LABELS[a.role] ?? a.role}</span>
+                <span className="activity-role" title={roleTitle(a.role)}>{currentRole(a.role)}</span>
               </div>
               <div className="activity-text">{a.description}</div>
               <div className="activity-time">{formatTime(a.updated_at)}</div>
