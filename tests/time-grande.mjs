@@ -450,6 +450,39 @@ await test("vida: ressurreição avisa quais travas se perderam e restaura a tas
   );
 });
 
+// ─── arquivado só volta pelo caminho certo ───────────────────────────────────
+
+await test("arquivado: nenhuma retomada acidental; desarquivar_agente reativa", async () => {
+  const pasta = join(TMP, "equipe-desarquiva");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-arq", pasta });
+  const sess = um.match(/\(id=([\w-]+)\)/)?.[1];
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+  await call("fechar_sessao", { session_id: sess });
+  await call("arquivar_agente", { agent: agentId });
+
+  // Furo antigo: retomar_agente_id no tool legado ignorava o arquivamento.
+  let recusa = null;
+  try {
+    await call("abrir_ou_retornar_agente", { cargo: "executor", retomar_agente_id: agentId, pasta });
+  } catch (e) {
+    recusa = e.message;
+  }
+  assert(
+    recusa && /arquivado/.test(recusa) && /desarquivar_agente/.test(recusa),
+    `retomada de arquivado deveria ser recusada apontando o caminho certo: ${recusa}`
+  );
+  const aindaArq = rawDb().prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
+  assert(aindaArq.status === "archived", `agente saiu do arquivo por acidente: ${aindaArq.status}`);
+
+  // Caminho certo: desarquivar e retomar.
+  const des = await call("desarquivar_agente", { agent: agentId });
+  assert(/desarquivado/.test(des), `desarquivar falhou: ${des}`);
+  const depois = rawDb().prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
+  assert(depois.status === "paused", `desarquivado deveria ficar paused: ${depois.status}`);
+  const volta = await call("abrir", { pasta, retomar_agente_id: agentId });
+  assert(volta.includes(agentId), `retomada após desarquivar falhou:\n${volta}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

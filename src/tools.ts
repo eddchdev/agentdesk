@@ -1596,6 +1596,14 @@ export const tools: ToolDef[] = [
       if (p.retomar_agente_id) {
         agent = findAgentById(db, p.retomar_agente_id);
         if (!agent) throw new Error(`Agente ${p.retomar_agente_id} não encontrado.`);
+        // Mesma regra do abrir: arquivado não retoma por acidente. Antes este
+        // caminho era o único que ignorava o arquivamento e "desarquivava"
+        // sem querer. O caminho legítimo é desarquivar_agente.
+        if (agent.status === "archived") {
+          throw new Error(
+            `Agente ${agent.name} está arquivado. Use desarquivar_agente antes de retomar.`
+          );
+        }
         mode = "resumed";
       } else if (p.preferred_name) {
         const existing = findAgentByName(db, p.preferred_name);
@@ -1978,7 +1986,49 @@ export const tools: ToolDef[] = [
       }
       setAgentStatus(db, ag.id, "archived", { current_session_id: null, current_task_id: null });
       recordEvent(db, null, "agent.archived", { agent_id: ag.id, agent_name: ag.name });
-      return text(`Agente ${ag.name} arquivado. Histórico preservado.`);
+      return text(`Agente ${ag.name} arquivado. Histórico preservado. Para reativar depois: desarquivar_agente.`);
+    },
+  },
+
+  {
+    name: "desarquivar_agente",
+    description:
+      "Reativa um agente arquivado (volta como 'paused', pronto para retomar com abrir). Se a equipe já elegeu outro gerente nesse meio tempo, o desarquivado volta como trabalhador.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "agent_id ou nome." },
+      },
+      required: ["agent"],
+    },
+    handler: (args) => {
+      const db = getDb();
+      const ag = getAgentByIdentifier(db, args.agent);
+      if (!ag) throw new Error(`Agente '${args.agent}' não encontrado.`);
+      if (ag.status !== "archived") {
+        return text(`Agente ${ag.name} não está arquivado (status=${ag.status}). Nada a fazer.`);
+      }
+      const ts = now();
+      const tx = db.transaction(() => {
+        // A equipe só pode ter um gerente ativo (índice único). Se outro foi
+        // eleito enquanto este esteve arquivado, ele volta como trabalhador.
+        if (ag.authority === "manager") {
+          const atual = findManagerForTeam(db, ag.team_key);
+          if (atual && atual.id !== ag.id) {
+            db.prepare("UPDATE agents SET authority = 'worker', updated_at = ? WHERE id = ?").run(ts, ag.id);
+          }
+        }
+        db.prepare(
+          "UPDATE agents SET status = 'paused', updated_at = ?, current_session_id = NULL, current_task_id = NULL WHERE id = ?"
+        ).run(ts, ag.id);
+      });
+      tx.immediate();
+      const depois = findAgentById(db, ag.id)!;
+      recordEvent(db, null, "agent.unarchived", { agent_id: ag.id, agent_name: ag.name });
+      return text(
+        `Agente ${ag.name} desarquivado (status paused, autoridade ${depois.authority === "manager" ? "gerente" : "trabalhador"}). ` +
+          `Retome com abrir (retomar_agente_id=${ag.id}).`
+      );
     },
   },
 
