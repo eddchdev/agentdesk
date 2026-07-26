@@ -194,6 +194,24 @@ await test("abrir_sessao: sessão morta com mesmo cargo+tarefa é retomada, não
   assert(sess.status === "active", `sessão retomada deveria estar active: ${sess.status}`);
 });
 
+// ─── faxina de tarefa zumbi ──────────────────────────────────────────────────
+
+await test("faxina: auto-close devolve as tasks da sessão (sem zumbi in_progress)", async () => {
+  const pasta = join(TMP, "equipe-zumbi");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-zumbi", pasta });
+  const sessId = um.match(/\(id=([\w-]+)\)/)?.[1];
+  assert(sessId, `não achei session_id:\n${um}`);
+
+  // 40 minutos sem notícias: passa do limite de auto-close (30min).
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 40 * 60_000, sessId);
+  await call("listar_status", {});
+
+  const sess = rawDb().prepare("SELECT status FROM sessions WHERE id = ?").get(sessId);
+  assert(sess.status === "closed", `sessão deveria auto-fechar: ${sess.status}`);
+  const task = rawDb().prepare("SELECT status FROM tasks WHERE session_id = ?").get(sessId);
+  assert(task.status === "pending", `task deveria voltar para 'pending', ficou '${task.status}'`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

@@ -79,6 +79,15 @@ export function sweepSessions(db: Database.Database): { marked_dead: string[]; r
     // Auto-close: sessions dead há mais de AUTO_CLOSE_AFTER_MS
     // Mantém o agente (persistente) mas limpa a session do histórico visível.
     const deadThreshold = ts - AUTO_CLOSE_AFTER_MS;
+    // Devolve as tasks antes de fechar. Sem isso elas ficavam 'in_progress'
+    // para sempre (fechar_sessao marca 'pending', o auto-close não marcava
+    // nada) e o painel acumulava tarefa zumbi de semanas.
+    db.prepare(
+      `UPDATE tasks SET status = 'pending', updated_at = ?
+       WHERE status = 'in_progress' AND session_id IN (
+         SELECT id FROM sessions WHERE status = 'dead' AND last_heartbeat < ?
+       )`
+    ).run(ts, deadThreshold);
     db.prepare(
       `UPDATE sessions SET status = 'closed', closed_at = ?
        WHERE status = 'dead' AND last_heartbeat < ?`
@@ -126,7 +135,7 @@ const GC_EVENTS_MS = 7 * 24 * 60 * 60 * 1000;
 const GC_CHAT_MS = 30 * 24 * 60 * 60 * 1000;
 const GC_SESSIONS_MS = 60 * 24 * 60 * 60 * 1000;
 
-export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number } {
+export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number } {
   const ts = now();
   const tx = db.transaction(() => {
     const e = db.prepare("DELETE FROM events WHERE created_at < ?").run(ts - GC_EVENTS_MS).changes;
@@ -134,7 +143,16 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
     const s = db.prepare(
       "DELETE FROM sessions WHERE status = 'closed' AND COALESCE(closed_at, 0) < ?"
     ).run(ts - GC_SESSIONS_MS).changes;
-    return { events: e, chat: c, sessions: s };
+    // Cura zumbis deixados por versões antigas: task 'in_progress' cuja
+    // sessão já fechou (ou nem existe mais) volta para 'pending'.
+    const t = db.prepare(
+      `UPDATE tasks SET status = 'pending', updated_at = ?
+       WHERE status = 'in_progress' AND (
+         session_id IN (SELECT id FROM sessions WHERE status = 'closed')
+         OR session_id NOT IN (SELECT id FROM sessions)
+       )`
+    ).run(ts).changes;
+    return { events: e, chat: c, sessions: s, tasks: t };
   });
   return tx.immediate() as any;
 }
