@@ -265,6 +265,35 @@ await test("equipes: sem pasta informada, herda a pasta do ambiente", async () =
   );
 });
 
+// ─── arquivamento de agente morto antigo ─────────────────────────────────────
+
+await test("faxina: agente morto há mais de 7 dias é arquivado, não apagado", async () => {
+  const pasta = join(TMP, "equipe-arquivo");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-antiga", pasta });
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+  const sessId = um.match(/\(id=([\w-]+)\)/)?.[1];
+  assert(agentId && sessId, `não achei ids:\n${um}`);
+
+  // Morre e fica 8 dias sem qualquer notícia.
+  const oitoDias = Date.now() - 8 * 24 * 60 * 60 * 1000;
+  rawDb().prepare("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ?").run(oitoDias, sessId);
+  rawDb().prepare(
+    "UPDATE agents SET status = 'dead', updated_at = ?, current_session_id = NULL WHERE id = ?"
+  ).run(oitoDias, agentId);
+
+  const { gcOldData } = await import(new URL("../dist/lifecycle.js", import.meta.url));
+  const gc = gcOldData(rawDb());
+  assert(gc.agents >= 1, `gc deveria arquivar pelo menos 1 agente, arquivou ${gc.agents}`);
+
+  const ag = rawDb().prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
+  assert(ag.status === "archived", `agente deveria estar arquivado: ${ag.status}`);
+
+  const padrao = await call("listar_agentes", { pasta });
+  assert(!padrao.includes(agentId), "arquivado ainda aparece na listagem padrão");
+  const completo = await call("listar_agentes", { pasta, incluir_arquivados: true });
+  assert(completo.includes(agentId), "arquivado sumiu do histórico (incluir_arquivados)");
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

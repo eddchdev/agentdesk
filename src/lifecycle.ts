@@ -134,8 +134,11 @@ export function requireActiveSession(db: Database.Database, sessionId: string): 
 const GC_EVENTS_MS = 7 * 24 * 60 * 60 * 1000;
 const GC_CHAT_MS = 30 * 24 * 60 * 60 * 1000;
 const GC_SESSIONS_MS = 60 * 24 * 60 * 60 * 1000;
+// Agente morto sem nenhuma notícia por 7 dias sai das listagens padrão.
+// Arquivar não apaga: listar_agentes com incluir_arquivados mostra tudo.
+const GC_DEAD_AGENT_MS = 7 * 24 * 60 * 60 * 1000;
 
-export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number } {
+export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number; agents: number } {
   const ts = now();
   const tx = db.transaction(() => {
     const e = db.prepare("DELETE FROM events WHERE created_at < ?").run(ts - GC_EVENTS_MS).changes;
@@ -143,6 +146,13 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
     const s = db.prepare(
       "DELETE FROM sessions WHERE status = 'closed' AND COALESCE(closed_at, 0) < ?"
     ).run(ts - GC_SESSIONS_MS).changes;
+    // Arquiva (não apaga) agente morto há mais de 7 dias. Ele sai do painel
+    // padrão mas segue no histórico; um gerente morto arquivado também libera
+    // a vaga de eleição da equipe (o índice único ignora arquivados).
+    const a = db.prepare(
+      `UPDATE agents SET status = 'archived', updated_at = ?
+       WHERE status = 'dead' AND updated_at < ?`
+    ).run(ts, ts - GC_DEAD_AGENT_MS).changes;
     // Cura zumbis deixados por versões antigas: task 'in_progress' cuja
     // sessão já fechou (ou nem existe mais) volta para 'pending'.
     const t = db.prepare(
@@ -152,7 +162,7 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
          OR session_id NOT IN (SELECT id FROM sessions)
        )`
     ).run(ts).changes;
-    return { events: e, chat: c, sessions: s, tasks: t };
+    return { events: e, chat: c, sessions: s, tasks: t, agents: a };
   });
   return tx.immediate() as any;
 }
