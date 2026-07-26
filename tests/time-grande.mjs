@@ -498,6 +498,19 @@ await test("handoff: nota com histórico é limitada (update gigante não explod
   assert(nota.includes("segue") && /update 4/.test(nota), `nota truncada perdeu o essencial:\n${nota.slice(0, 200)}`);
 });
 
+// ─── formato humano do tempo sem notícias ────────────────────────────────────
+
+await test("painel: tempo sem notícias em formato humano (dias, não milhares de minutos)", async () => {
+  const pasta = join(TMP, "equipe-formato");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "tarefa-formato", pasta });
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+  const quatroDias = Date.now() - 4 * 24 * 60 * 60 * 1000;
+  rawDb().prepare("UPDATE agents SET status = 'dead', last_heartbeat = ?, current_session_id = NULL WHERE id = ?").run(quatroDias, agentId);
+  rawDb().prepare("UPDATE sessions SET status = 'closed', closed_at = ? WHERE agent_id = ?").run(quatroDias, agentId);
+  const lista = await call("listar_agentes", { pasta });
+  assert(/dead \(sem notícias há 4 dias\)/.test(lista), `formato deveria ser em dias:\n${lista}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;

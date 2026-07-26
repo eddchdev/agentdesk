@@ -249,7 +249,12 @@ function cabecalhoEscopo(teamKey: string | null): string {
 function anotaSemNoticias(status: string, lastMs: number): string {
   if (status !== "dead" && status !== "suspect") return status;
   const min = Math.max(1, Math.round((now() - lastMs) / 60_000));
-  return `${status} (sem notícias há ${min}min)`;
+  const idade = min < 60
+    ? `${min}min`
+    : min < 48 * 60
+      ? `${Math.round(min / 60)}h`
+      : `${Math.round(min / (24 * 60))} dias`;
+  return `${status} (sem notícias há ${idade})`;
 }
 
 function renderTeamContext(db: Database.Database, teamKey?: string | null): string {
