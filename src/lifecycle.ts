@@ -23,6 +23,7 @@ export interface SessionRow {
   status: SessionStatus;
   closed_at: number | null;
   agent_id?: string | null;
+  agent_name?: string | null;
 }
 
 export function deriveStatus(row: { last_heartbeat: number; status: SessionStatus; closed_at: number | null }): SessionStatus {

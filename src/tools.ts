@@ -473,7 +473,7 @@ export const tools: ToolDef[] = [
   {
     name: "abrir_sessao",
     description:
-      "Compatibilidade: abre sessão informando papel e tarefa manualmente. Novos clientes devem usar abrir.",
+      "Compatibilidade: abre sessão informando papel e tarefa manualmente. Novos clientes devem usar abrir. Se já existir sessão viva com o mesmo cargo e tarefa na mesma equipe, recusa (force_new=true cria mesmo assim); se existir sessão morta, retoma em vez de duplicar.",
     inputSchema: {
       type: "object",
       properties: {
@@ -491,6 +491,11 @@ export const tools: ToolDef[] = [
           items: { type: "string" },
           description: "Lista de arquivos que pretende editar (paths).",
         },
+        force_new: {
+          type: "boolean",
+          default: false,
+          description: "Cria um segundo agente mesmo já havendo sessão viva com o mesmo cargo e tarefa.",
+        },
       },
       required: ["cargo", "tarefa"],
     },
@@ -502,12 +507,69 @@ export const tools: ToolDef[] = [
         pasta: z.string().optional().default(""),
         areas: z.array(z.string()).optional().default([]),
         arquivos_pretendidos: z.array(z.string()).optional().default([]),
+        force_new: z.boolean().optional().default(false),
       });
       const p = schema.parse(args);
       const db = getDb();
       sweepSessions(db);
 
-      // Legacy: cria sempre agente novo (sem retomada). Pra retomada use abrir_ou_retornar_agente.
+      // Proteção contra duplicata: na operação real, o retry do cliente após
+      // um falso-morto criava dois agentes com o mesmo cargo e a mesma tarefa
+      // ("um morto e um trabalhando"). Sessão viva igual recusa; morta retoma.
+      const dedupTeamKey = deriveTeamKey(p.pasta, p.projeto);
+      if (!p.force_new) {
+        const iguais = db.prepare(
+          `SELECT * FROM sessions
+           WHERE team_key = ? AND role = ? AND task = ? AND status != 'closed' AND closed_at IS NULL
+           ORDER BY last_heartbeat DESC`
+        ).all(dedupTeamKey, p.cargo, p.tarefa) as SessionRow[];
+        for (const existente of iguais) {
+          const st = deriveStatus(existente);
+          if (st === "active" || st === "suspect") {
+            const quem = existente.agent_name || existente.name;
+            throw new Error(
+              `Já existe ${quem} trabalhando nesta mesma tarefa (sessão ${existente.name}, ` +
+                `session_id=${existente.id}, status=${st}). Para continuar aquele trabalho, ` +
+                `use abrir com retomar_agente_id; para criar mesmo assim um segundo agente, ` +
+                `re-chame com force_new=true.`
+            );
+          }
+          if (st === "dead" && existente.agent_id) {
+            const dono = findAgentById(db, existente.agent_id);
+            if (dono && dono.status !== "archived") {
+              const reaberta = reopenSession(db, existente.id, p.tarefa, dono);
+              recordEvent(db, reaberta.sessionId, "session.reopened_dedup", {
+                agent_id: dono.id,
+                role: p.cargo,
+                task: p.tarefa,
+              });
+              postChat(db, {
+                sessionId: reaberta.sessionId,
+                sessionName: reaberta.sessionName,
+                role: p.cargo,
+                type: "falar",
+                agentId: dono.id,
+                agentName: dono.name,
+                message: `Voltei. Retomando a mesma tarefa: ${p.tarefa}.`,
+              });
+              return text(
+                [
+                  `Sessão retomada (não duplicada): ${reaberta.sessionName} (id=${reaberta.sessionId})`,
+                  `Agente: ${dono.name} [id=${dono.id}]`,
+                  `Papel: ${p.cargo}`,
+                  `Tarefa: ${p.tarefa}`,
+                  `Tarefa principal (task_id): ${reaberta.taskId}`,
+                  "",
+                  "Havia uma sessão sem notícias com este mesmo cargo e tarefa; ela foi reaproveitada.",
+                  "Guarde session_id, agent_id e task_id para usar nos próximos comandos.",
+                ].join("\n")
+              );
+            }
+          }
+        }
+      }
+
+      // Legacy: cria agente novo. Pra retomada por nome use abrir_ou_retornar_agente.
       const agentName = pickUniqueName(db);
       const agent = createAgent(db, {
         name: agentName,

@@ -148,6 +148,52 @@ await test("painel: suspeito e morto mostram 'sem notícias há Xmin'", async ()
   );
 });
 
+// ─── sessão única por cargo+tarefa ───────────────────────────────────────────
+
+await test("abrir_sessao: recusa duplicar cargo+tarefa com sessão viva", async () => {
+  const pasta = join(TMP, "equipe-dedup");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "arreio-canal-oficial", pasta });
+  assert(/Sessão aberta/.test(um), `primeira abertura falhou:\n${um}`);
+
+  let recusa = null;
+  try {
+    await call("abrir_sessao", { cargo: "executor", tarefa: "arreio-canal-oficial", pasta });
+  } catch (e) {
+    recusa = e.message;
+  }
+  assert(
+    recusa && /Já existe .* trabalhando nesta mesma tarefa/.test(recusa),
+    `segunda abertura deveria ser recusada dizendo quem já está lá: ${recusa}`
+  );
+  const n1 = rawDb().prepare("SELECT COUNT(*) AS n FROM agents WHERE team_key = ?").get(`folder:${pasta}`).n;
+  assert(n1 === 1, `esperava 1 agente na equipe após a recusa, tem ${n1}`);
+
+  const dois = await call("abrir_sessao", {
+    cargo: "executor", tarefa: "arreio-canal-oficial", pasta, force_new: true,
+  });
+  assert(/Sessão aberta/.test(dois), `force_new=true deveria criar mesmo assim:\n${dois}`);
+});
+
+await test("abrir_sessao: sessão morta com mesmo cargo+tarefa é retomada, não clonada", async () => {
+  const pasta = join(TMP, "equipe-dedup-morta");
+  const um = await call("abrir_sessao", { cargo: "executor", tarefa: "arreio-canal-oficial", pasta });
+  const sessId = um.match(/\(id=([\w-]+)\)/)?.[1];
+  const agentId = um.match(/\[id=([\w-]+)\]/)?.[1];
+  assert(sessId && agentId, `não achei ids na saída:\n${um}`);
+
+  // Sessão fica 7 minutos sem notícias; sweep marca morta e libera tudo.
+  rawDb().prepare("UPDATE sessions SET last_heartbeat = ? WHERE id = ?").run(Date.now() - 400_000, sessId);
+  await call("listar_status", {});
+
+  const dois = await call("abrir_sessao", { cargo: "executor", tarefa: "arreio-canal-oficial", pasta });
+  assert(/Sessão retomada \(não duplicada\)/.test(dois), `deveria retomar a sessão morta:\n${dois}`);
+  assert(dois.includes(agentId), `retomada não reaproveitou o mesmo agente:\n${dois}`);
+  const n = rawDb().prepare("SELECT COUNT(*) AS n FROM agents WHERE team_key = ?").get(`folder:${pasta}`).n;
+  assert(n === 1, `retomada criou agente novo (total ${n})`);
+  const sess = rawDb().prepare("SELECT status FROM sessions WHERE id = ?").get(sessId);
+  assert(sess.status === "active", `sessão retomada deveria estar active: ${sess.status}`);
+});
+
 // ─── relatório ───────────────────────────────────────────────────────────────
 
 const passed = results.filter((r) => r.ok).length;
