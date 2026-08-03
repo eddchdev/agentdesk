@@ -9,6 +9,7 @@ Estas regras valem para toda sessão conectada ao MCP `agentdesk`.
 3. Os seguintes entram como trabalhadores `disponivel`.
 4. `abrir` já liga `auto_mode`, restaura a identidade quando possível e tenta assumir o próximo work item pronto.
 5. Guarde `session_id` e siga `proximo_passo`. Não peça ao usuário para chamar `/auto` separadamente.
+6. A entrada é limpa: o histórico anterior da pasta (inbox, chat, work items, travas) não é despejado, só contado. Se a resposta indicar contexto guardado e o trabalho for mesmo a continuação, reabra com `recuperar=true`. Trabalho antigo ou de outro assunto: ignore e siga a fila.
 
 O usuário ainda precisa abrir as janelas/terminais. O AgentDesk coordena agentes existentes; ele não cria processos Claude sozinho.
 
