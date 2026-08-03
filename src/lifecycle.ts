@@ -143,6 +143,13 @@ export function sweepSessions(
   // Fora da transação: a equipe precisa saber que a tarefa voltou para a fila,
   // senão o item reaparece "do nada" para outro agente.
   for (const item of requeued) {
+    // Evento além do aviso no chat: é o que o relatório usa para contar
+    // quanto trabalho a equipe perde por janela que some.
+    recordEvent(db, item.session_id, "work_item.requeued", {
+      id: item.id,
+      title: item.title,
+      owner_agent_name: item.owner_agent_name,
+    });
     postChat(db, {
       sessionId: item.session_id,
       sessionName: item.session_name,

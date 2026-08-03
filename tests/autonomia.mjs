@@ -504,6 +504,17 @@ async function run() {
     assert(/prova-ok/.test(entregue.validation_summary), `saída do comando não foi guardada:\n${entregue.validation_summary}`);
   });
 
+  await test("relatorio_equipe mede entrega, prova e paralelismo", async () => {
+    const saida = managerClient.text(
+      await managerClient.call("relatorio_equipe", { session_id: manager.sessionId, dias: 1 })
+    );
+    assert(/entregues: 1\b/.test(saida), `relatório não contou a entrega:\n${saida}`);
+    assert(/prova executada: 1 de 1/.test(saida), `relatório não contou a prova:\n${saida}`);
+    assert(/paralelismo: [\d.]+x/.test(saida), `relatório sem o ganho de paralelismo:\n${saida}`);
+    assert(/por agente: /.test(saida), `relatório sem quebra por agente:\n${saida}`);
+    assert(saida.length < 3_000, `relatório longo demais (${saida.length} chars)`);
+  });
+
   await test("tarefa de janela que sumiu volta para a fila", async () => {
     const worker = workers[2];
     const item = batchItems.find((row) => row.assigned_to === worker.name);

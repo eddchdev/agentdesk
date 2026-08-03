@@ -238,6 +238,50 @@ const ESCOPO_PROPS = {
   todas_equipes: { type: "boolean", default: false, description: "Mostra todas as equipes (visão global explícita)." },
 } as const;
 
+// Medição da produção. Mediana e p90 em vez de média: uma tarefa esquecida
+// aberta a noite toda distorce a média e some na mediana.
+function quantil(valores: number[], q: number): number {
+  if (!valores.length) return 0;
+  const ordenados = [...valores].sort((a, b) => a - b);
+  const indice = Math.min(ordenados.length - 1, Math.round(q * (ordenados.length - 1)));
+  return ordenados[indice];
+}
+
+// Tempo de relógio em que pelo menos uma tarefa esteve em execução. Somar as
+// durações direto contaria duas vezes o que rodou em paralelo, que é
+// justamente o que se quer medir.
+function uniaoMs(intervalos: Array<[number, number]>): number {
+  const ordenados = intervalos.filter(([ini, fim]) => fim > ini).sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let ini = 0;
+  let fim = 0;
+  let aberto = false;
+  for (const [a, b] of ordenados) {
+    if (!aberto) {
+      ini = a;
+      fim = b;
+      aberto = true;
+    } else if (a <= fim) {
+      fim = Math.max(fim, b);
+    } else {
+      total += fim - ini;
+      ini = a;
+      fim = b;
+    }
+  }
+  return aberto ? total + (fim - ini) : total;
+}
+
+function dur(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  if (min < 1) return "menos de 1min";
+  if (min < 90) return `${min}min`;
+  const horas = Math.floor(min / 60);
+  const resto = min % 60;
+  if (horas < 48) return resto ? `${horas}h${String(resto).padStart(2, "0")}` : `${horas}h`;
+  return `${Math.round(horas / 24)} dias`;
+}
+
 function cabecalhoEscopo(teamKey: string | null): string {
   return teamKey
     ? `EQUIPE: ${teamKey}  (use todas_equipes=true para ver todas)`
@@ -1381,6 +1425,115 @@ export const tools: ToolDef[] = [
       out.push("");
       out.push(renderRecentChat(db, 15, teamKey));
 
+      return text(out.join("\n"));
+    },
+  },
+
+  {
+    name: "relatorio_equipe",
+    description:
+      "Mede a produção real da equipe no período: tarefas entregues e concluídas, tempo por tarefa, espera na fila e na revisão, retrabalho, tarefas devolvidas por janela que sumiu, quanto o paralelismo rendeu contra fazer tudo em série e quantas entregas tiveram prova executada.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dias: { type: "number", default: 7, description: "Janela de análise em dias (1 a 90)." },
+        ...ESCOPO_PROPS,
+      },
+    },
+    handler: (args) => {
+      const db = getDb();
+      sweepSessions(db);
+      const teamKey = resolveTeamScope(db, args);
+      const dias = Math.min(Math.max(Math.round(Number(args?.dias ?? 7)), 1), 90);
+      const desde = now() - dias * 24 * 60 * 60 * 1000;
+
+      const itens = db
+        .prepare(
+          `SELECT * FROM work_items
+            WHERE (? IS NULL OR team_key = ?)
+              AND (created_at >= ? OR COALESCE(claimed_at, 0) >= ? OR COALESCE(delivered_at, 0) >= ? OR COALESCE(reviewed_at, 0) >= ?)`
+        )
+        .all(teamKey, teamKey, desde, desde, desde, desde) as WorkItemRow[];
+
+      const criadas = itens.filter((i) => i.created_at >= desde);
+      const entregues = itens.filter((i) => i.delivered_at && i.delivered_at >= desde && i.claimed_at);
+      const concluidas = itens.filter((i) => i.status === "done" && i.reviewed_at && i.reviewed_at >= desde);
+      const reprovadas = itens.filter((i) => i.status === "blocked" && i.reviewed_at && i.reviewed_at >= desde);
+
+      const ciclo = entregues.map((i) => i.delivered_at! - i.claimed_at!).filter((v) => v >= 0);
+      const fila = itens
+        .filter((i) => i.claimed_at && i.claimed_at >= desde)
+        .map((i) => i.claimed_at! - i.created_at)
+        .filter((v) => v >= 0);
+      const revisao = itens
+        .filter((i) => i.reviewed_at && i.reviewed_at >= desde && i.delivered_at)
+        .map((i) => i.reviewed_at! - i.delivered_at!)
+        .filter((v) => v >= 0);
+
+      // Ganho do paralelismo: soma do tempo trabalhado dividida pelo tempo de
+      // relógio em que pelo menos uma tarefa esteve em execução. É a medida
+      // honesta de "quantas vezes mais rápido que fazer uma de cada vez".
+      const intervalos = entregues.map((i) => [i.claimed_at!, i.delivered_at!] as [number, number]);
+      const somaTrabalho = intervalos.reduce((total, [a, b]) => total + Math.max(0, b - a), 0);
+      const relogio = uniaoMs(intervalos);
+      const ganho = relogio > 0 ? somaTrabalho / relogio : 0;
+
+      const comProva = entregues.filter((i) => /\(exit 0\)/.test(i.validation_summary ?? "")).length;
+      const semProva = entregues.filter((i) => /prova: nenhuma/.test(i.validation_summary ?? "")).length;
+
+      const devolvidas = (db
+        .prepare(
+          `SELECT count(*) AS n FROM events e
+             LEFT JOIN sessions s ON s.id = e.session_id
+            WHERE e.type = 'work_item.requeued' AND e.created_at >= ?
+              AND (? IS NULL OR s.team_key = ?)`
+        )
+        .get(desde, teamKey, teamKey) as { n: number }).n;
+
+      const porAgente = new Map<string, number[]>();
+      for (const item of entregues) {
+        const nome = item.owner_agent_name ?? "—";
+        const lista = porAgente.get(nome) ?? [];
+        lista.push(item.delivered_at! - item.claimed_at!);
+        porAgente.set(nome, lista);
+      }
+
+      const out: string[] = [];
+      out.push(`${cabecalhoEscopo(teamKey)}  ·  últimos ${dias} dia(s)`);
+      out.push("");
+      if (!entregues.length && !criadas.length) {
+        out.push("Nenhuma tarefa criada ou entregue no período. Nada para medir ainda.");
+        return text(out.join("\n"));
+      }
+      out.push(
+        `criadas: ${criadas.length} · entregues: ${entregues.length} · concluídas: ${concluidas.length} · ` +
+          `reprovadas na revisão: ${reprovadas.length} · devolvidas por janela que sumiu: ${devolvidas}`
+      );
+      if (ciclo.length) {
+        out.push(`tempo por tarefa (assumir até entregar): mediana ${dur(quantil(ciclo, 0.5))}, pior 10% ${dur(quantil(ciclo, 0.9))}`);
+      }
+      if (fila.length) out.push(`espera na fila (criada até assumida): mediana ${dur(quantil(fila, 0.5))}`);
+      if (revisao.length) out.push(`espera na revisão (entregue até revisada): mediana ${dur(quantil(revisao, 0.5))}`);
+      if (relogio > 0) {
+        out.push(
+          `paralelismo: ${ganho.toFixed(1)}x contra fazer uma de cada vez ` +
+            `(${dur(somaTrabalho)} de trabalho somado em ${dur(relogio)} de relógio)`
+        );
+      }
+      if (entregues.length) {
+        const pct = Math.round((comProva / entregues.length) * 100);
+        out.push(`entregas com prova executada: ${comProva} de ${entregues.length} (${pct}%)${semProva ? `, ${semProva} só com relato` : ""}`);
+      }
+      if (porAgente.size) {
+        const linhas = [...porAgente.entries()]
+          .sort((a, b) => b[1].length - a[1].length)
+          .map(([nome, tempos]) => `${nome} ${tempos.length} (mediana ${dur(quantil(tempos, 0.5))})`);
+        out.push(`por agente: ${linhas.join(" · ")}`);
+      }
+      if (dias > 7) {
+        out.push("");
+        out.push("nota: 'devolvidas por janela que sumiu' vem do log de eventos, que é apagado após 7 dias; períodos maiores contam menos que o real.");
+      }
       return text(out.join("\n"));
     },
   },
