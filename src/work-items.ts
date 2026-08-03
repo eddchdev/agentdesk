@@ -30,6 +30,8 @@ export interface WorkItemRow {
   validation_summary: string | null;
   worktree_path: string | null;
   branch_name: string | null;
+  integration_url: string | null;
+  integrated_at: number | null;
   created_at: number;
   updated_at: number;
   claimed_at: number | null;
@@ -310,14 +312,14 @@ export function updateWorkItemStatus(
   db: Database.Database,
   id: string,
   status: WorkItemStatus,
-  fields: Partial<Pick<WorkItemRow, "blocked_reason" | "delivery_summary" | "validation_summary" | "worktree_path" | "branch_name">> = {}
+  fields: Partial<Pick<WorkItemRow, "blocked_reason" | "delivery_summary" | "validation_summary" | "worktree_path" | "branch_name" | "integration_url">> = {}
 ): WorkItemRow {
   const item = getWorkItem(db, id);
   if (!item) throw new Error(`Tarefa estruturada ${id} não encontrada.`);
   const ts = now();
   const sets = ["status = ?", "updated_at = ?"];
   const vals: any[] = [status, ts];
-  for (const key of ["blocked_reason", "delivery_summary", "validation_summary", "worktree_path", "branch_name"] as const) {
+  for (const key of ["blocked_reason", "delivery_summary", "validation_summary", "worktree_path", "branch_name", "integration_url"] as const) {
     if (key in fields) {
       sets.push(`${key} = ?`);
       vals.push(fields[key] ?? null);

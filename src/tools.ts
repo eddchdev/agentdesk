@@ -30,7 +30,7 @@ import {
   updateWorkItemStatus,
   type WorkItemRow,
 } from "./work-items.js";
-import { prepareWorktree } from "./worktree.js";
+import { integrarWorktree, prepareWorktree } from "./worktree.js";
 import {
   assignAgentRole,
   createOrGetManager,
@@ -384,6 +384,7 @@ function formatWorkItem(w: WorkItemRow): string {
     w.delivery_summary ? `entrega: ${w.delivery_summary}` : null,
     w.validation_summary ? `validação: ${w.validation_summary}` : null,
     w.worktree_path ? `worktree: ${w.worktree_path}` : null,
+    w.integration_url ? `integração: ${w.integration_url}` : null,
     w.branch_name ? `branch: ${w.branch_name}` : null,
   ].filter(Boolean).join("\n");
 }
@@ -2963,7 +2964,109 @@ export const tools: ToolDef[] = [
         agentName: ag?.name ?? null,
       });
       recordEvent(db, s.id, "work_item.reviewed", { id: item.id, approved: args.aprovado });
-      return text(`Review registrado:\n${formatWorkItem(item)}`);
+      return text([
+        `Review registrado:`,
+        formatWorkItem(item),
+        args.aprovado && item.branch_name
+          ? `proximo_passo: chame integrar_tarefa para empurrar a branch e abrir o PR deste item.`
+          : "",
+      ].filter(Boolean).join("\n"));
+    },
+  },
+
+  {
+    name: "integrar_tarefa",
+    description:
+      "Fecha o ciclo de um item aprovado: commita o que está na worktree dele, empurra a branch e abre o PR. Nunca faz merge: quem decide o que entra na branch principal é a pessoa.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        work_item_id: { type: "string" },
+        mensagem: { type: "string", description: "Título do commit e do PR. Padrão: o título do item." },
+        enviar: { type: "boolean", default: true, description: "Empurra a branch para o origin." },
+        abrir_pr: { type: "boolean", default: true, description: "Abre o PR com gh (precisa de gh instalado e autenticado)." },
+        refazer: { type: "boolean", default: false, description: "Integra de novo um item que já tem integração registrada." },
+      },
+      required: ["session_id", "work_item_id"],
+    },
+    handler: (args) => {
+      const db = getDb();
+      const s = requireActiveSession(db, args.session_id);
+      const ag = getAgentByActiveSession(db, s.id);
+      const current = getWorkItem(db, args.work_item_id);
+      if (!current) throw new Error(`Work item ${args.work_item_id} não encontrado.`);
+      if (!ag || current.team_key !== teamKeyForSession(s, ag)) {
+        throw new Error("Work item pertence a outra equipe.");
+      }
+      // Só integra o que já passou pela revisão: empurrar branch de item ainda
+      // em execução enche o repositório de trabalho pela metade.
+      if (current.status !== "done") {
+        throw new Error(
+          `Work item ${current.id} está em ${current.status}; só item aprovado na revisão (done) é integrado.`
+        );
+      }
+      if (current.integration_url && !args.refazer) {
+        return text(`Este item já foi integrado: ${current.integration_url}. Use refazer=true para integrar de novo.`);
+      }
+      if (!current.worktree_path || !current.branch_name) {
+        throw new Error(
+          `Work item ${current.id} não tem worktree própria (o trabalho foi feito direto na pasta). ` +
+            `Integre manualmente ou refaça o item com worktree.`
+        );
+      }
+
+      const titulo = String(args.mensagem ?? current.title).trim();
+      const corpo = [
+        current.delivery_summary ? `O que foi feito: ${current.delivery_summary}` : null,
+        current.validation_summary ? `\nValidação:\n${current.validation_summary}` : null,
+        current.acceptance ? `\nCritério de aceite: ${current.acceptance}` : null,
+        `\nItem ${current.id} do AgentDesk, executado por ${current.owner_agent_name ?? "—"}.`,
+      ].filter(Boolean).join("\n");
+
+      const resultado = integrarWorktree({
+        worktreePath: current.worktree_path,
+        branch: current.branch_name,
+        titulo,
+        corpo,
+        enviar: args.enviar !== false,
+        abrirPr: args.abrir_pr !== false,
+      });
+
+      if (resultado.pr_url) {
+        db.prepare("UPDATE work_items SET integration_url = ?, integrated_at = ?, updated_at = ? WHERE id = ?")
+          .run(resultado.pr_url, now(), now(), current.id);
+      } else if (resultado.enviada) {
+        db.prepare("UPDATE work_items SET integration_url = ?, integrated_at = ?, updated_at = ? WHERE id = ?")
+          .run(`branch ${resultado.branch} enviada`, now(), now(), current.id);
+      }
+
+      recordEvent(db, s.id, "work_item.integrated", {
+        id: current.id,
+        branch: resultado.branch,
+        commit: resultado.commit,
+        pr_url: resultado.pr_url,
+      });
+      postChat(db, {
+        sessionId: s.id,
+        sessionName: s.name,
+        role: s.role,
+        type: "decisao",
+        message:
+          `INTEGRADO ${current.id}: branch ${resultado.branch}` +
+          (resultado.pr_url ? ` · PR ${resultado.pr_url}` : resultado.enviada ? " (sem PR)" : " (só local)"),
+        agentId: ag?.id ?? null,
+        agentName: ag?.name ?? null,
+      });
+
+      return text([
+        `Integrado: ${current.id}`,
+        `branch: ${resultado.branch}${resultado.enviada ? " (enviada)" : " (não enviada)"}`,
+        resultado.commit ? `commit: ${resultado.commit} · ${resultado.arquivos.length} arquivo(s)` : "commit: nada novo a commitar",
+        resultado.pr_url ? `PR: ${resultado.pr_url}` : "PR: não aberto",
+        ...resultado.avisos.map((aviso) => `aviso: ${aviso}`),
+        "O merge continua com a pessoa: o AgentDesk não junta nada sozinho.",
+      ].join("\n"));
     },
   },
 

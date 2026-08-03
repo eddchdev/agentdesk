@@ -19,7 +19,8 @@
 //
 // O test usa apenas a saída isError + texto pra decidir pass/fail.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnMcp } from "./helpers/mcp-process.mjs";
@@ -555,6 +556,68 @@ async function run() {
     const cheio = P2.text(await P2.call("abrir", { pasta, preferred_name: "Velho", recuperar: true }));
     assert(/mensagem-velha-da-equipe/.test(cheio), `recuperar=true não trouxe o histórico:\n${cheio}`);
     await P2.close();
+  });
+
+  // ─── 17c. ciclo completo: worktree -> entrega com prova -> review -> integração
+  await test("integrar_tarefa commita o trabalho do item na branch dele", async () => {
+    const repo = join(DB_DIR, "repo-integracao");
+    mkdirSync(repo, { recursive: true });
+    const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "teste@agentdesk.local");
+    git("config", "user.name", "AgentDesk Teste");
+    writeFileSync(join(repo, "README.md"), "base\n");
+    git("add", "README.md");
+    git("commit", "-qm", "base");
+
+    const G = new Client("G-integra");
+    await G.initialize();
+    const gRes = await G.call("abrir", { pasta: repo, force_new: true });
+    const gSess = extractValue(G.text(gRes), "session_id");
+    await G.call("distribuir_tarefas", {
+      session_id: gSess,
+      tarefas: [{ chave: "arq", titulo: "criar arquivo novo", aceite: "arquivo existe" }],
+      estrategia: "fila",
+    });
+
+    const W = new Client("W-integra");
+    await W.initialize();
+    const wRes = await W.call("abrir", { pasta: repo, force_new: true });
+    const wSess = extractValue(W.text(wRes), "session_id");
+    const tick = W.text(await W.call("tick_autonomo", { session_id: wSess }));
+    const itemId = tick.match(/^item:\s*(\S+)/m)?.[1];
+    assert(itemId, `não achei o id do item no tick:\n${tick}`);
+    const worktree = tick.match(/^worktree:\s*(\S+)/m)?.[1];
+    assert(worktree, `item não ganhou worktree:\n${tick}`);
+
+    writeFileSync(join(worktree, "novo.txt"), "trabalho do agente\n");
+    await W.call("entregar_tarefa", {
+      session_id: wSess,
+      work_item_id: itemId,
+      resumo: "criei o arquivo",
+      validacao: "conferi o conteúdo",
+      comando: "test -f novo.txt",
+    });
+    await G.call("revisar_tarefa", {
+      session_id: gSess,
+      work_item_id: itemId,
+      aprovado: true,
+      validacao: "conferido",
+    });
+
+    const saida = G.text(
+      await G.call("integrar_tarefa", { session_id: gSess, work_item_id: itemId, enviar: false, abrir_pr: false })
+    );
+    assert(/commit: [0-9a-f]{7}/.test(saida), `integração não commitou:\n${saida}`);
+    assert(/novo\.txt|1 arquivo/.test(saida), `commit não listou o arquivo:\n${saida}`);
+    const commitado = execFileSync("git", ["show", "--name-only", "--format=%s", "HEAD"], {
+      cwd: worktree,
+      encoding: "utf8",
+    });
+    assert(/criar arquivo novo/.test(commitado), `mensagem do commit errada:\n${commitado}`);
+    assert(/novo\.txt/.test(commitado), `arquivo não entrou no commit:\n${commitado}`);
+    await G.close();
+    await W.close();
   });
 
   // ─── 18. heartbeat em sessão fechada falha ────────────────────────
