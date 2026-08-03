@@ -140,6 +140,41 @@ export function integrarWorktree(input: {
   return { branch: input.branch, commit, arquivos, enviada, pr_url: prUrl, avisos };
 }
 
+// Arquivos que a branch deste item realmente mexeu: o que já está commitado
+// desde a base mais o que ainda está solto na worktree. A trava declarada só
+// pega quem declarou; isto pega o choque de verdade, antes do merge.
+export function arquivosTocados(worktreePath: string): string[] {
+  if (!existsSync(worktreePath)) return [];
+  const rodar = (args: string[]) =>
+    execFileSync("git", args, {
+      cwd: worktreePath,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 15_000,
+    });
+  const arquivos = new Set<string>();
+  try {
+    for (const linha of rodar(["status", "--porcelain"]).split("\n")) {
+      const caminho = linha.slice(3).trim();
+      if (caminho) arquivos.add(caminho.split(" -> ").pop()!);
+    }
+  } catch {
+    return [];
+  }
+  try {
+    const base = baseDoRepo(worktreePath, (cmd, args) => rodar(args));
+    const merge = rodar(["merge-base", "HEAD", `origin/${base}`]).trim() || rodar(["merge-base", "HEAD", base]).trim();
+    if (merge) {
+      for (const caminho of rodar(["diff", "--name-only", `${merge}..HEAD`]).split("\n")) {
+        if (caminho.trim()) arquivos.add(caminho.trim());
+      }
+    }
+  } catch {
+    /* branch sem base comparável: fica só com o que está solto */
+  }
+  return [...arquivos];
+}
+
 function baseDoRepo(cwd: string, rodar: (cmd: string, args: string[], dir?: string) => string): string {
   try {
     const ref = rodar("git", ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).trim();

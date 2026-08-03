@@ -30,7 +30,7 @@ import {
   updateWorkItemStatus,
   type WorkItemRow,
 } from "./work-items.js";
-import { integrarWorktree, prepareWorktree } from "./worktree.js";
+import { arquivosTocados, integrarWorktree, prepareWorktree } from "./worktree.js";
 import {
   assignAgentRole,
   createOrGetManager,
@@ -280,6 +280,33 @@ function dur(ms: number): string {
   const resto = min % 60;
   if (horas < 48) return resto ? `${horas}h${String(resto).padStart(2, "0")}` : `${horas}h`;
   return `${Math.round(horas / 24)} dias`;
+}
+
+// Choque de verdade: dois itens abertos que mexeram no mesmo arquivo. A trava
+// declarada só enxerga quem declarou; aqui a fonte é o próprio git de cada
+// worktree. Item já integrado sai da conta: o PR dele já mostra o diff.
+function conflitosReais(
+  db: Database.Database,
+  teamKey: string | null
+): Array<{ arquivo: string; itens: WorkItemRow[] }> {
+  const abertos = listWorkItems(db, { limit: 100, team_key: teamKey }).filter(
+    (item) =>
+      item.worktree_path &&
+      ["working", "review", "done"].includes(item.status) &&
+      !(item.status === "done" && item.integration_url)
+  );
+  const porArquivo = new Map<string, WorkItemRow[]>();
+  for (const item of abertos) {
+    for (const arquivo of arquivosTocados(item.worktree_path!)) {
+      const lista = porArquivo.get(arquivo) ?? [];
+      lista.push(item);
+      porArquivo.set(arquivo, lista);
+    }
+  }
+  return [...porArquivo.entries()]
+    .filter(([, itens]) => itens.length > 1)
+    .map(([arquivo, itens]) => ({ arquivo, itens }))
+    .sort((a, b) => b.itens.length - a.itens.length);
 }
 
 function cabecalhoEscopo(teamKey: string | null): string {
@@ -1536,6 +1563,116 @@ export const tools: ToolDef[] = [
         out.push("nota: 'devolvidas por janela que sumiu' vem do log de eventos, que é apagado após 7 dias; períodos maiores contam menos que o real.");
       }
       return text(out.join("\n"));
+    },
+  },
+
+  {
+    name: "painel",
+    description:
+      "Responde 'e agora?': lista o que espera decisão da pessoa (PR para juntar, item aprovado sem integrar, bloqueio), o que ainda está com a equipe, a fila e choques reais entre branches. Leitura pura, não precisa de sessão aberta.",
+    inputSchema: {
+      type: "object",
+      properties: { ...ESCOPO_PROPS },
+    },
+    handler: (args) => {
+      const db = getDb();
+      sweepSessions(db);
+      const teamKey = resolveTeamScope(db, args);
+      const itens = listWorkItems(db, { limit: 100, team_key: teamKey });
+      const agentes = teamKey ? listAgentsForTeam(db, teamKey) : listAgents(db);
+
+      const paraJuntar = itens.filter((i) => i.status === "done" && i.integration_url);
+      const paraIntegrar = itens.filter((i) => i.status === "done" && !i.integration_url);
+      const bloqueados = itens.filter((i) => i.status === "blocked");
+      const emRevisao = itens.filter((i) => i.status === "review");
+      const emExecucao = itens.filter((i) => i.status === "working");
+      const naFila = itens.filter((i) => i.status === "queued");
+      const ociosos = agentes.filter((a) => ["available", "paused"].includes(a.status));
+      const trabalhando = agentes.filter((a) => a.status === "working");
+
+      const alertas = db
+        .prepare(
+          `SELECT * FROM chat_messages
+            WHERE type = 'alerta' AND (? IS NULL OR team_key = ?) AND created_at > ?
+            ORDER BY created_at DESC LIMIT 5`
+        )
+        .all(teamKey, teamKey, now() - 24 * 60 * 60 * 1000) as any[];
+
+      const choques = conflitosReais(db, teamKey);
+
+      const seuTurno: string[] = [];
+      for (const item of paraJuntar) {
+        seuTurno.push(`PR esperando você juntar: ${item.integration_url} (${item.id} · ${item.title})`);
+      }
+      for (const item of paraIntegrar) {
+        seuTurno.push(`aprovado e parado sem integrar: ${item.id} · ${item.title} -> chame integrar_tarefa`);
+      }
+      for (const item of bloqueados) {
+        seuTurno.push(
+          `bloqueado há ${idadeHumana(item.updated_at)}: ${item.id} · ${item.title} -> causa: ${item.blocked_reason ?? "não informada"}`
+        );
+      }
+      for (const alerta of alertas) {
+        seuTurno.push(`alerta (${idadeHumana(alerta.created_at)}): ${alerta.agent_name ?? alerta.session_name}: ${alerta.message}`);
+      }
+
+      const comEquipe: string[] = [];
+      for (const item of emRevisao) {
+        comEquipe.push(`em revisão há ${idadeHumana(item.delivered_at ?? item.updated_at)}: ${item.id} · ${item.title} (autor ${item.owner_agent_name ?? "—"})`);
+      }
+      for (const item of emExecucao) {
+        comEquipe.push(`em execução há ${idadeHumana(item.claimed_at ?? item.updated_at)}: ${item.id} · ${item.title} (${item.owner_agent_name ?? "—"})`);
+      }
+
+      const out: string[] = [cabecalhoEscopo(teamKey), ""];
+      out.push(`PRECISA DE VOCÊ (${seuTurno.length}):`);
+      out.push(...(seuTurno.length ? seuTurno.map((linha) => `- ${linha}`) : ["- nada; a equipe não está esperando decisão sua"]));
+      out.push("");
+      out.push(`COM A EQUIPE (${comEquipe.length}):`);
+      out.push(...(comEquipe.length ? comEquipe.map((linha) => `- ${linha}`) : ["- ninguém executando nem revisando"]));
+      out.push("");
+      out.push(
+        `FILA: ${naFila.length} pronto(s) · ${trabalhando.length} agente(s) trabalhando · ${ociosos.length} livre(s)` +
+          (naFila.length && ociosos.length ? " -> tem trabalho parado com gente livre" : "")
+      );
+      if (emRevisao.length && trabalhando.length + ociosos.length < 2) {
+        out.push("aviso: só há um agente na equipe; entrega em revisão vai ficar parada, abra outra janela ou revise você.");
+      }
+      if (choques.length) {
+        out.push("");
+        out.push("CHOQUE REAL ENTRE BRANCHES (mesmo arquivo mexido por mais de um item):");
+        for (const choque of choques.slice(0, 10)) {
+          out.push(`- ${choque.arquivo}: ${choque.itens.map((i) => `${i.id} (${i.owner_agent_name ?? "—"})`).join(" e ")}`);
+        }
+      }
+      return text(out.join("\n"));
+    },
+  },
+
+  {
+    name: "conflitos_entre_branches",
+    description:
+      "Compara os arquivos que cada branch de item realmente mexeu (commitados e soltos na worktree) e aponta os que colidem. Diferente de detectar_conflitos, não depende de o agente ter declarado a trava.",
+    inputSchema: {
+      type: "object",
+      properties: { ...ESCOPO_PROPS },
+    },
+    handler: (args) => {
+      const db = getDb();
+      const teamKey = resolveTeamScope(db, args);
+      const choques = conflitosReais(db, teamKey);
+      if (!choques.length) {
+        return text(`${cabecalhoEscopo(teamKey)}\nNenhum arquivo aparece em duas branches de item ao mesmo tempo.`);
+      }
+      const lines = [cabecalhoEscopo(teamKey), "Arquivos mexidos por mais de um item:"];
+      for (const choque of choques) {
+        lines.push(`- ${choque.arquivo}`);
+        for (const item of choque.itens) {
+          lines.push(`    ${item.id} [${item.status}] ${item.title} · ${item.owner_agent_name ?? "—"} · branch ${item.branch_name ?? "—"}`);
+        }
+      }
+      lines.push("Resolva juntando na ordem, ou separe os escopos antes de integrar.");
+      return text(lines.join("\n"));
     },
   },
 

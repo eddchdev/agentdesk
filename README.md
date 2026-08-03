@@ -244,6 +244,7 @@ Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
 | `atribuir_papel` | Gerente define ou troca o papel livre de um agente. |
 | `listar_status` | Snapshot operacional da equipe, fila, chat e locks. |
 | `relatorio_equipe` | Mede a produção do período: entregas, tempo por tarefa, espera na fila e na revisão, retrabalho e quanto o paralelismo rendeu contra fazer uma de cada vez. |
+| `painel` | Responde "e agora?": o que espera decisão sua, o que está com a equipe, a fila e os choques entre branches. |
 | `fechar_sessao` / `pausar_agente` | Encerra ou pausa preservando identidade e histórico. |
 
 ### Planejamento e execução
@@ -265,6 +266,7 @@ Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
 |---|---|
 | `travar_arquivos` / `liberar_travas` | Locks cooperativos para caminhos e globs. |
 | `detectar_conflitos` | Verifica sobreposição antes do trabalho começar. |
+| `conflitos_entre_branches` | Compara o que cada branch de item realmente mexeu; pega o choque mesmo quando ninguém declarou a trava. |
 | `enviar_mensagem` / `pedir_acao` | Comunicação geral ou direcionada. |
 | `passar_tarefa` | Handoff explícito com contexto persistido. |
 | `atualizar_progresso` | Resumo curto para a equipe e o desktop. |

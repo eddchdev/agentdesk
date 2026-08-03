@@ -620,6 +620,70 @@ async function run() {
     await W.close();
   });
 
+  // ─── 17d. painel e choque real entre branches ─────────────────────
+  await test("painel aponta o que espera você e o choque real entre branches", async () => {
+    const repo = join(DB_DIR, "repo-painel");
+    mkdirSync(repo, { recursive: true });
+    const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "teste@agentdesk.local");
+    git("config", "user.name", "AgentDesk Teste");
+    writeFileSync(join(repo, "comum.txt"), "base\n");
+    git("add", "comum.txt");
+    git("commit", "-qm", "base");
+
+    const G = new Client("G-painel");
+    await G.initialize();
+    const gSess = extractValue(G.text(await G.call("abrir", { pasta: repo, force_new: true })), "session_id");
+    await G.call("distribuir_tarefas", {
+      session_id: gSess,
+      estrategia: "fila",
+      tarefas: [
+        { chave: "a", titulo: "mexer no comum pela esquerda" },
+        { chave: "b", titulo: "mexer no comum pela direita" },
+      ],
+    });
+
+    const worktrees = [];
+    const itens = [];
+    for (const label of ["W1-painel", "W2-painel"]) {
+      const C = new Client(label);
+      await C.initialize();
+      const sess = extractValue(C.text(await C.call("abrir", { pasta: repo, force_new: true })), "session_id");
+      const tick = C.text(await C.call("tick_autonomo", { session_id: sess }));
+      const id = tick.match(/^item:\s*(\S+)/m)?.[1];
+      const wt = tick.match(/^worktree:\s*(\S+)/m)?.[1];
+      assert(id && wt, `worker não assumiu item com worktree:\n${tick}`);
+      writeFileSync(join(wt, "comum.txt"), `mexido por ${label}\n`);
+      worktrees.push(wt);
+      itens.push({ client: C, sess, id });
+    }
+
+    const choque = G.text(await G.call("conflitos_entre_branches", { pasta: repo }));
+    assert(/comum\.txt/.test(choque), `choque real não detectado:\n${choque}`);
+    assert(itens.every((i) => choque.includes(i.id)), `choque não listou os dois itens:\n${choque}`);
+
+    // Um entrega e é aprovado: fica parado esperando integração, que é decisão da pessoa.
+    await itens[0].client.call("entregar_tarefa", {
+      session_id: itens[0].sess,
+      work_item_id: itens[0].id,
+      resumo: "mexi no comum",
+      validacao: "conferido",
+      comando: "test -f comum.txt",
+    });
+    await G.call("revisar_tarefa", {
+      session_id: gSess, work_item_id: itens[0].id, aprovado: true, validacao: "ok",
+    });
+
+    const painel = G.text(await G.call("painel", { pasta: repo }));
+    assert(/PRECISA DE VOCÊ \(([1-9]\d*)\)/.test(painel), `painel não listou pendência sua:\n${painel}`);
+    assert(painel.includes(itens[0].id) && /sem integrar/.test(painel), `painel não apontou o item aprovado:\n${painel}`);
+    assert(/COM A EQUIPE/.test(painel) && painel.includes(itens[1].id), `painel não mostrou o item em execução:\n${painel}`);
+    assert(/CHOQUE REAL/.test(painel), `painel não avisou do choque:\n${painel}`);
+    for (const item of itens) await item.client.close();
+    await G.close();
+  });
+
   // ─── 18. heartbeat em sessão fechada falha ────────────────────────
   await test("heartbeat em sessão fechada falha", async () => {
     const O = new Client("O");
