@@ -243,6 +243,7 @@ Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
 | `listar_agentes` | Mostra identidade, autoridade, papel atual, carga e estado. |
 | `atribuir_papel` | Gerente define ou troca o papel livre de um agente. |
 | `listar_status` | Snapshot operacional da equipe, fila, chat e locks. |
+| `relatorio_equipe` | Mede a produção do período: entregas, tempo por tarefa, espera na fila e na revisão, retrabalho e quanto o paralelismo rendeu contra fazer uma de cada vez. |
 | `fechar_sessao` / `pausar_agente` | Encerra ou pausa preservando identidade e histórico. |
 
 ### Planejamento e execução
