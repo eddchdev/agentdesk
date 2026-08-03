@@ -39,7 +39,18 @@ export function deriveStatus(row: { last_heartbeat: number; status: SessionStatu
 // retomar agentes que ficaram em pausa sem fechar (ex: usuário fechou laptop).
 export const AUTO_CLOSE_AFTER_MS = 30 * 60_000;
 
-export function sweepSessions(db: Database.Database): { marked_dead: string[]; released_locks: number } {
+export interface OrfaoRequeued {
+  id: string;
+  title: string;
+  owner_agent_name: string | null;
+  session_id: string;
+  session_name: string;
+  session_role: string;
+}
+
+export function sweepSessions(
+  db: Database.Database
+): { marked_dead: string[]; released_locks: number; requeued: OrfaoRequeued[] } {
   const markedDead: string[] = [];
   const updateStatus = db.prepare("UPDATE sessions SET status = ? WHERE id = ?");
   const releaseLocks = db.prepare(
@@ -53,6 +64,7 @@ export function sweepSessions(db: Database.Database): { marked_dead: string[]; r
   );
 
   let releasedTotal = 0;
+  let requeued: OrfaoRequeued[] = [];
   const ts = now();
 
   const tx = db.transaction(() => {
@@ -94,6 +106,33 @@ export function sweepSessions(db: Database.Database): { marked_dead: string[]; r
          SELECT id FROM sessions WHERE status = 'dead' AND last_heartbeat < ?
        )`
     ).run(ts, deadThreshold);
+
+    // Work item cujo dono sumiu de vez volta para a fila. Antes, o sweep
+    // liberava as travas mas o item continuava 'working' com um dono morto: o
+    // auto-claim só enxerga item sem dono, então aquele trabalho saía da fila
+    // em silêncio e ninguém mais pegava. Usa o corte do auto-close (30min sem
+    // notícia), não o de 'dead' (6min), para não roubar item de quem está só
+    // num build longo — nesse intervalo requireActiveSession ressuscita a
+    // sessão e o dono continua com o item.
+    requeued = db
+      .prepare(
+        `SELECT w.id, w.title, w.owner_agent_name, s.id AS session_id, s.name AS session_name, s.role AS session_role
+           FROM work_items w
+           JOIN sessions s ON s.id = w.owner_session_id
+          WHERE w.status IN ('working', 'claimed')
+            AND s.status = 'dead' AND s.last_heartbeat < ?`
+      )
+      .all(deadThreshold) as OrfaoRequeued[];
+    if (requeued.length) {
+      const devolve = db.prepare(
+        `UPDATE work_items
+            SET status = 'queued', owner_agent_id = NULL, owner_agent_name = NULL,
+                owner_session_id = NULL, updated_at = ?
+          WHERE id = ?`
+      );
+      for (const item of requeued) devolve.run(ts, item.id);
+    }
+
     db.prepare(
       `UPDATE sessions SET status = 'closed', closed_at = ?
        WHERE status = 'dead' AND last_heartbeat < ?`
@@ -101,7 +140,22 @@ export function sweepSessions(db: Database.Database): { marked_dead: string[]; r
   });
   tx.immediate();
 
-  return { marked_dead: markedDead, released_locks: releasedTotal };
+  // Fora da transação: a equipe precisa saber que a tarefa voltou para a fila,
+  // senão o item reaparece "do nada" para outro agente.
+  for (const item of requeued) {
+    postChat(db, {
+      sessionId: item.session_id,
+      sessionName: item.session_name,
+      role: item.session_role,
+      type: "alerta",
+      message:
+        `Tarefa ${item.id} (${item.title}) voltou para a fila: a janela de ` +
+        `${item.owner_agent_name ?? item.session_name} ficou 30min sem dar sinal. ` +
+        `Qualquer agente livre pode assumir; o trabalho já feito continua na worktree dela.`,
+    });
+  }
+
+  return { marked_dead: markedDead, released_locks: releasedTotal, requeued };
 }
 
 export function requireActiveSession(db: Database.Database, sessionId: string): SessionRow {
@@ -176,7 +230,7 @@ const GC_SESSIONS_MS = 60 * 24 * 60 * 60 * 1000;
 // Arquivar não apaga: listar_agentes com incluir_arquivados mostra tudo.
 const GC_DEAD_AGENT_MS = 7 * 24 * 60 * 60 * 1000;
 
-export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number; agents: number } {
+export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number; agents: number; work_items: number } {
   const ts = now();
   const tx = db.transaction(() => {
     const e = db.prepare("DELETE FROM events WHERE created_at < ?").run(ts - GC_EVENTS_MS).changes;
@@ -200,7 +254,21 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
          OR session_id NOT IN (SELECT id FROM sessions)
        )`
     ).run(ts).changes;
-    return { events: e, chat: c, sessions: s, tasks: t, agents: a };
+    // Mesma cura para work item: dono cuja sessão já foi fechada ou apagada
+    // deixava o item preso em 'working' para sempre. Cobre também os itens
+    // que ficaram presos por versões antigas, antes do requeue do sweep.
+    const w = db.prepare(
+      `UPDATE work_items
+          SET status = 'queued', owner_agent_id = NULL, owner_agent_name = NULL,
+              owner_session_id = NULL, updated_at = ?
+        WHERE status IN ('working', 'claimed')
+          AND owner_session_id IS NOT NULL
+          AND (
+            owner_session_id IN (SELECT id FROM sessions WHERE status = 'closed')
+            OR owner_session_id NOT IN (SELECT id FROM sessions)
+          )`
+    ).run(ts).changes;
+    return { events: e, chat: c, sessions: s, tasks: t, agents: a, work_items: w };
   });
   return tx.immediate() as any;
 }

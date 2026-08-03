@@ -296,7 +296,7 @@ await test("faxina: agente morto há mais de 7 dias é arquivado, não apagado",
 
 // ─── entrada única ───────────────────────────────────────────────────────────
 
-await test("abrir: entrada única traz inbox, equipe, fila, travas e chat numa resposta só", async () => {
+await test("abrir: entrada limpa por padrão, contexto completo só com recuperar", async () => {
   const pasta = join(TMP, "equipe-entrada");
   const g = await call("abrir", { pasta, force_new: true });
   const gSess = grab(g, "session_id");
@@ -312,16 +312,24 @@ await test("abrir: entrada única traz inbox, equipe, fila, travas e chat numa r
   });
 
   // Um trabalhador entra com UMA chamada, declarando um arquivo extra.
+  // Por padrão não herda o histórico da pasta: só conta o que existe guardado.
   const w = await call("abrir", { pasta, force_new: true, arquivos_pretendidos: [join(pasta, "src", "novo.ts")] });
-  assert(w.includes("decisão: API usa REST"), `entrada sem o chat recente:\n${w}`);
-  assert(/EQUIPE ATIVA/.test(w), "entrada sem a lista da equipe");
-  assert(/WORK ITEMS ESTRUTURADOS/.test(w), "entrada sem a fila de work items");
-  assert(/TRAVAS ATIVAS/.test(w) && w.includes("src/db.ts"), "entrada sem as travas da equipe");
-  assert(/INBOX de/.test(w), "entrada sem inbox");
+  assert(!w.includes("decisão: API usa REST"), `entrada padrão despejou o chat antigo:\n${w}`);
+  assert(!/EQUIPE ATIVA|WORK ITEMS ESTRUTURADOS|INBOX de/.test(w), `entrada padrão despejou contexto:\n${w}`);
+  assert(/contexto anterior/.test(w) && /recuperar=true/.test(w), `entrada padrão não ofereceu recuperar:\n${w}`);
   assert(
     /travas concedidas na entrada/.test(w) && w.includes("novo.ts"),
     "não travou o arquivo declarado na entrada"
   );
+
+  // Sob pedido, a mesma chamada devolve tudo o que o agente precisaria buscar
+  // em listar_status + listar_chat + inbox_agente.
+  const cheio = await call("abrir", { pasta, force_new: true, recuperar: true });
+  assert(cheio.includes("decisão: API usa REST"), `recuperar não trouxe o chat recente:\n${cheio}`);
+  assert(/EQUIPE ATIVA/.test(cheio), "recuperar sem a lista da equipe");
+  assert(/WORK ITEMS ESTRUTURADOS/.test(cheio), "recuperar sem a fila de work items");
+  assert(/TRAVAS ATIVAS/.test(cheio) && cheio.includes("src/db.ts"), "recuperar sem as travas da equipe");
+  assert(/INBOX de/.test(cheio), "recuperar sem inbox");
 
   // Arquivo já travado por outro é recusado dizendo quem segura.
   const w2 = await call("abrir", { pasta, force_new: true, arquivos_pretendidos: [join(pasta, "src/db.ts")] });

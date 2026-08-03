@@ -254,7 +254,7 @@ Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
 | `delegar_tarefa` | Compatibilidade para uma delegação individual. |
 | `assumir_tarefa` | Claim atômico manual; o fluxo auto também pode assumir o próximo item pronto. |
 | `bloquear_tarefa` | Registra impedimento concreto e devolve capacidade à fila. |
-| `entregar_tarefa` | Entrega resumo e validação sem obrigar o trabalhador a ficar parado. |
+| `entregar_tarefa` | Entrega resumo e validação sem obrigar o trabalhador a ficar parado. Com `comando`, o MCP roda o build/test na worktree e recusa a entrega se falhar. |
 | `revisar_tarefa` | Gerente ou outro par da equipe revisa de forma assíncrona; não existe cargo fixo de QA. |
 
 ### Coordenação
