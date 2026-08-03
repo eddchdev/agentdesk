@@ -50,9 +50,11 @@ Ao receber `EXECUTAR`:
 2. Decida sozinho tudo que for reversível e estiver dentro do aceite.
 3. Registre progresso apenas em marcos úteis, não a cada passo.
 4. Valide com build/test/check proporcional ao risco.
-5. Chame `entregar_tarefa`; o item vai para revisão assíncrona e o próximo item pronto é assumido sem espera.
+5. Chame `entregar_tarefa` passando `comando` com essa validação (ex: `npm test`, `npx tsc --noEmit`). O MCP roda o comando na worktree e recusa a entrega se falhar; sem `comando`, a entrega vai marcada como não verificada. O item vai para revisão assíncrona e o próximo item pronto é assumido sem espera.
 
 Ao encontrar impedimento real, chame `bloquear_tarefa` com causa concreta. Locks são liberados, o gerente é avisado e outro item pronto é puxado imediatamente.
+
+Se a sua janela ficar 30 minutos sem chamar nenhuma tool, o AgentDesk devolve o item para a fila e avisa a equipe. O trabalho já feito continua na worktree; ao voltar, reassuma pelo `tick_autonomo`.
 
 ## Política de decisão sem gargalo
 

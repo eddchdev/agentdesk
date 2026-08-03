@@ -9,7 +9,7 @@
 //
 // Run: npm run build && node tests/autonomia.mjs
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
@@ -467,6 +467,68 @@ async function run() {
       new Set(stored.map((item) => item.owner_agent_id)).size === 3,
       "um worker monopolizou mais de um item do primeiro wave"
     );
+  });
+
+  await test("entrega só passa quando o comando de prova roda e passa", async () => {
+    mkdirSync(PROJECT_DIR, { recursive: true });
+    const worker = workers[0];
+    const item = batchItems.find((row) => row.assigned_to === worker.name);
+    assert(item, `nenhum item para ${worker.name}`);
+
+    let recusou = false;
+    try {
+      await worker.client.call("entregar_tarefa", {
+        session_id: worker.sessionId,
+        work_item_id: item.id,
+        resumo: "diz que fez",
+        validacao: "rodei os testes",
+        comando: "exit 1",
+      });
+    } catch (error) {
+      recusou = /Entrega recusada/.test(error.message);
+    }
+    assert(recusou, "entrega passou mesmo com a prova falhando");
+    const aindaWorking = db.prepare("SELECT status FROM work_items WHERE id = ?").get(item.id);
+    assert(aindaWorking.status === "working", `item saiu de working após prova falha: ${aindaWorking.status}`);
+
+    await worker.client.call("entregar_tarefa", {
+      session_id: worker.sessionId,
+      work_item_id: item.id,
+      resumo: "feito de verdade",
+      validacao: "check do projeto",
+      comando: "echo prova-ok",
+    });
+    const entregue = db.prepare("SELECT status, validation_summary FROM work_items WHERE id = ?").get(item.id);
+    assert(entregue.status === "review", `item não foi para review: ${entregue.status}`);
+    assert(/exit 0/.test(entregue.validation_summary), `prova não ficou registrada:\n${entregue.validation_summary}`);
+    assert(/prova-ok/.test(entregue.validation_summary), `saída do comando não foi guardada:\n${entregue.validation_summary}`);
+  });
+
+  await test("tarefa de janela que sumiu volta para a fila", async () => {
+    const worker = workers[2];
+    const item = batchItems.find((row) => row.assigned_to === worker.name);
+    assert(item, `nenhum item para ${worker.name}`);
+
+    // Simula a janela que foi embora: 31min sem nenhuma chamada de tool.
+    const writeDb = new Database(DB_PATH);
+    writeDb
+      .prepare("UPDATE sessions SET last_heartbeat = ?, status = 'dead' WHERE id = ?")
+      .run(Date.now() - 31 * 60_000, worker.sessionId);
+    writeDb.close();
+
+    // Qualquer tool roda o sweep; o gerente serve.
+    await managerClient.call("listar_status", { session_id: manager.sessionId });
+
+    const devolvido = db
+      .prepare("SELECT status, owner_agent_id, owner_session_id FROM work_items WHERE id = ?")
+      .get(item.id);
+    assert(devolvido.status === "queued", `item ficou preso em ${devolvido.status} com dono morto`);
+    assert(!devolvido.owner_agent_id && !devolvido.owner_session_id, "item voltou para a fila mantendo o dono morto");
+
+    const aviso = db
+      .prepare("SELECT message FROM chat_messages WHERE message LIKE ? ORDER BY created_at DESC LIMIT 1")
+      .get(`%${item.id}%voltou para a fila%`);
+    assert(aviso, "equipe não foi avisada de que a tarefa voltou para a fila");
   });
 
   await test("worker não ganha autoridade administrativa pelo papel", async () => {

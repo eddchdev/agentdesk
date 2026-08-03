@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import type Database from "better-sqlite3";
 import { getDb, now } from "./db.js";
 import { newId, pickSessionName } from "./ids.js";
@@ -558,6 +560,37 @@ function renderInbox(db: Database.Database, agent: AgentRow, since: number): str
 // em toda abertura enchia a janela nova com histórico velho da pasta (às vezes
 // de semanas atrás) antes do agente fazer qualquer coisa. Agora a entrada só
 // diz QUANTO existe; o conteúdo vem sob pedido (recuperar=true).
+// Entrega com prova: 'validacao' é texto livre, então nada impedia entregar
+// "rodei os testes" sem ter rodado nada. Quando o agente informa o comando, o
+// próprio MCP executa (na worktree do item) e guarda o resultado junto da
+// entrega. Falhou, não entrega.
+function cauda(texto: string, linhas = 25): string {
+  const todas = texto.trimEnd().split("\n");
+  return todas.length <= linhas ? todas.join("\n") : ["...(saída cortada)", ...todas.slice(-linhas)].join("\n");
+}
+
+function rodarProva(comando: string, cwd: string, timeoutMs: number): { ok: boolean; resumo: string } {
+  try {
+    const saida = execSync(comando, {
+      cwd,
+      timeout: timeoutMs,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return { ok: true, resumo: `prova: ${comando} (exit 0) em ${cwd}\n${cauda(saida)}` };
+  } catch (error: any) {
+    const saida = [error?.stdout, error?.stderr].filter(Boolean).join("\n").toString();
+    const motivo = error?.signal === "SIGTERM"
+      ? `estourou ${Math.round(timeoutMs / 1000)}s`
+      : `exit ${error?.status ?? "?"}`;
+    return {
+      ok: false,
+      resumo: `prova: ${comando} (${motivo}) em ${cwd}\n${cauda(saida || String(error?.message ?? error))}`,
+    };
+  }
+}
+
 function renderResumoEntrada(db: Database.Database, teamKey: string, agent: AgentRow): string {
   const { msgs, handoffs } = inboxRows(db, agent, agent.last_seen_ms || agent.created_at);
   const abertos = listWorkItems(db, { limit: 100, team_key: teamKey })
@@ -2640,7 +2673,7 @@ export const tools: ToolDef[] = [
   {
     name: "entregar_tarefa",
     description:
-      "Entrega um work item para review. Informe resumo e validação executada (build/test/check ou justificativa).",
+      "Entrega um work item para review. Informe resumo e validação executada. Passe 'comando' com o build/test/check da entrega: o MCP roda de verdade na worktree e recusa a entrega se falhar. Sem comando, a entrega vai marcada como não verificada.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2648,6 +2681,11 @@ export const tools: ToolDef[] = [
         work_item_id: { type: "string" },
         resumo: { type: "string" },
         validacao: { type: "string", description: "Comandos/checagens executados ou justificativa se não rodou." },
+        comando: {
+          type: "string",
+          description: "Comando de validação a executar como prova (ex: 'npm test', 'npx tsc --noEmit'). Roda na worktree do item.",
+        },
+        timeout_s: { type: "number", default: 300, description: "Tempo máximo do comando de prova (10 a 1800s)." },
         manter_travas: { type: "boolean", default: false },
       },
       required: ["session_id", "work_item_id", "resumo", "validacao"],
@@ -2673,9 +2711,33 @@ export const tools: ToolDef[] = [
         throw new Error(`Work item ${current.id} está em status ${current.status}; só working/claimed entrega.`);
       }
 
+      // Prova da entrega. Sem comando, a entrega passa mas fica marcada como
+      // não verificada, para o revisor saber o que está aprovando.
+      let validacao: string = args.validacao;
+      if (args.comando) {
+        const cwd = [current.worktree_path, current.folder, s.folder]
+          .find((dir) => dir && existsSync(dir)) as string | undefined;
+        if (!cwd) throw new Error("Não achei a pasta do item para rodar a prova (worktree e pasta não existem).");
+        const timeoutMs = Math.min(Math.max(Number(args.timeout_s ?? 300), 10), 1800) * 1000;
+        const prova = rodarProva(String(args.comando), cwd, timeoutMs);
+        recordEvent(db, s.id, "work_item.proof", {
+          id: current.id,
+          comando: args.comando,
+          ok: prova.ok,
+        });
+        if (!prova.ok) {
+          throw new Error(
+            `Entrega recusada: a validação falhou, o item continua com você.\n${prova.resumo}\nCorrija e entregue de novo.`
+          );
+        }
+        validacao = `${args.validacao}\n${prova.resumo}`;
+      } else {
+        validacao = `${args.validacao}\nprova: nenhuma (relato do autor, não verificado pelo AgentDesk)`;
+      }
+
       const item = updateWorkItemStatus(db, args.work_item_id, "review", {
         delivery_summary: args.resumo,
-        validation_summary: args.validacao,
+        validation_summary: validacao,
       });
       let released = 0;
       if (args.manter_travas !== true) released = releaseLocks(db, s.id).released.length;
@@ -2684,7 +2746,7 @@ export const tools: ToolDef[] = [
         sessionName: s.name,
         role: s.role,
         type: "decisao",
-        message: `ENTREGUE para review work item ${item.id}: ${args.resumo}. Validação: ${args.validacao}`,
+        message: `ENTREGUE para review work item ${item.id}: ${args.resumo}. Validação: ${validacao}`,
         agentId: ag?.id ?? null,
         agentName: ag?.name ?? null,
       });
@@ -2692,6 +2754,7 @@ export const tools: ToolDef[] = [
       const next = autoClaimNext(db, s, ag);
       return text([
         `Entregue: ${item.id} -> review assíncrono. Travas liberadas: ${released}.`,
+        args.comando ? `prova: ${args.comando} passou (exit 0).` : "prova: nenhuma; o revisor verá que não foi verificado.",
         next
           ? `Próximo item assumido sem espera: ${next.id} · ${next.title}`
           : "Fila pronta vazia; continue em auto.",
