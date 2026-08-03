@@ -246,15 +246,18 @@ function cabecalhoEscopo(teamKey: string | null): string {
 // notícia dele. "dead"/"suspect" secos afirmavam mais do que o sistema sabe
 // (e mentiam para agente que passa 20min só lendo código). A anotação diz o
 // fato observável.
-function anotaSemNoticias(status: string, lastMs: number): string {
-  if (status !== "dead" && status !== "suspect") return status;
+function idadeHumana(lastMs: number): string {
   const min = Math.max(1, Math.round((now() - lastMs) / 60_000));
-  const idade = min < 60
+  return min < 60
     ? `${min}min`
     : min < 48 * 60
       ? `${Math.round(min / 60)}h`
       : `${Math.round(min / (24 * 60))} dias`;
-  return `${status} (sem notícias há ${idade})`;
+}
+
+function anotaSemNoticias(status: string, lastMs: number): string {
+  if (status !== "dead" && status !== "suspect") return status;
+  return `${status} (sem notícias há ${idadeHumana(lastMs)})`;
 }
 
 function renderTeamContext(db: Database.Database, teamKey?: string | null): string {
@@ -497,7 +500,7 @@ function getAgentByActiveSession(db: Database.Database, sessionId: string): Agen
   return getAgentForSession(db, sessionId);
 }
 
-function renderInbox(db: Database.Database, agent: AgentRow, since: number): string {
+function inboxRows(db: Database.Database, agent: AgentRow, since: number): { msgs: any[]; handoffs: any[] } {
   // Mensagens para este agente (por nome ou papel atual) + handoffs pendentes.
   const msgs = db
     .prepare(
@@ -526,6 +529,11 @@ function renderInbox(db: Database.Database, agent: AgentRow, since: number): str
     )
     .all(agent.team_key, agent.name, agent.role) as any[];
 
+  return { msgs, handoffs };
+}
+
+function renderInbox(db: Database.Database, agent: AgentRow, since: number): string {
+  const { msgs, handoffs } = inboxRows(db, agent, since);
   const lines: string[] = [];
   lines.push(`INBOX de ${agent.name} [${agent.role}] (desde ${new Date(since).toISOString().replace("T", " ").slice(0, 19)}):`);
   if (!msgs.length && !handoffs.length) {
@@ -546,17 +554,34 @@ function renderInbox(db: Database.Database, agent: AgentRow, since: number): str
   return lines.join("\n");
 }
 
-// Entrada única: o abrir devolve numa resposta só o que o agente antes
-// precisava buscar em listar_status + listar_chat + inbox_agente (com 9
-// agentes numa frente, cada chamada extra de entrada custa caro) e já trava
-// os arquivos declarados.
+// Entrada limpa por padrão: despejar inbox + time + work items + travas + chat
+// em toda abertura enchia a janela nova com histórico velho da pasta (às vezes
+// de semanas atrás) antes do agente fazer qualquer coisa. Agora a entrada só
+// diz QUANTO existe; o conteúdo vem sob pedido (recuperar=true).
+function renderResumoEntrada(db: Database.Database, teamKey: string, agent: AgentRow): string {
+  const { msgs, handoffs } = inboxRows(db, agent, agent.last_seen_ms || agent.created_at);
+  const abertos = listWorkItems(db, { limit: 100, team_key: teamKey })
+    .filter((w) => !["done", "canceled"].includes(w.status)).length;
+  const travas = activeLocks(db, 100, teamKey).length;
+  const ultima = listChat(db, { limit: 1, team_key: teamKey })[0];
+  const pendencias = msgs.length + handoffs.length;
+  if (!pendencias && !abertos && !travas) return "contexto anterior: nada guardado nesta pasta.";
+  return [
+    `contexto anterior NÃO carregado (evita entrar com histórico velho):`,
+    `  ${pendencias} no inbox · ${abertos} work item(s) aberto(s) · ${travas} trava(s)` +
+      (ultima ? ` · última atividade da equipe há ${idadeHumana(ultima.created_at)}` : ""),
+    `  quer retomar isso? reabra com recuperar=true (ou chame restaurar_contexto). Se for trabalho antigo, ignore e siga.`,
+  ].join("\n");
+}
+
 function renderContextoEntrada(
   db: Database.Database,
   teamKey: string,
   agent: AgentRow,
   sessionId: string,
   arquivos: string[],
-  areas: string[]
+  areas: string[],
+  recuperar: boolean
 ): string {
   const lines: string[] = [];
   if (arquivos.length) {
@@ -569,6 +594,10 @@ function renderContextoEntrada(
     }
   }
   lines.push("");
+  if (!recuperar) {
+    lines.push(renderResumoEntrada(db, teamKey, agent));
+    return lines.join("\n");
+  }
   lines.push(renderInbox(db, agent, agent.last_seen_ms || agent.created_at));
   lines.push("");
   lines.push(renderTeamContext(db, teamKey));
@@ -1363,6 +1392,12 @@ export const tools: ToolDef[] = [
         preferred_name: { type: "string", description: "Nome desejado; retoma se existir ou usa ao criar." },
         retomar_agente_id: { type: "string", description: "Opcional para retomar uma identidade conhecida." },
         force_new: { type: "boolean", default: false, description: "Cria novo trabalhador; nunca cria um segundo gerente." },
+        recuperar: {
+          type: "boolean",
+          default: false,
+          description:
+            "Padrão false: entra limpo e só informa quanto contexto existe guardado. true carrega o histórico completo (inbox, time, work items, travas, chat). Só peça true quando o trabalho anterior desta pasta for mesmo a continuação.",
+        },
         tmux_pane: { type: "string", description: "Pane tmux atual, para push do loop auto." },
         areas: { type: "array", items: { type: "string" }, description: "Áreas/módulos que pretende mexer." },
         arquivos_pretendidos: {
@@ -1379,6 +1414,7 @@ export const tools: ToolDef[] = [
         preferred_name: z.string().optional(),
         retomar_agente_id: z.string().optional(),
         force_new: z.boolean().optional().default(false),
+        recuperar: z.boolean().optional().default(false),
         tmux_pane: z.string().optional(),
         areas: z.array(z.string()).optional().default([]),
         arquivos_pretendidos: z.array(z.string()).optional().default([]),
@@ -1497,7 +1533,7 @@ export const tools: ToolDef[] = [
               : claimed
                 ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
                 : "proximo_passo: chame tick_autonomo compacto; a fila será assumida automaticamente quando houver item pronto.",
-            renderContextoEntrada(db, teamKey, agent, live.id, p.arquivos_pretendidos, p.areas),
+            renderContextoEntrada(db, teamKey, agent, live.id, p.arquivos_pretendidos, p.areas, p.recuperar),
           ].join("\n"));
         }
       }
@@ -1555,7 +1591,7 @@ export const tools: ToolDef[] = [
           : claimed
             ? "proximo_passo: execute agora; decida sozinho tudo que for reversível e entregue ao validar."
             : "proximo_passo: rode tick_autonomo compacto; ele assumirá automaticamente o primeiro item pronto.",
-        renderContextoEntrada(db, teamKey, agent, opened.sessionId, p.arquivos_pretendidos, p.areas),
+        renderContextoEntrada(db, teamKey, agent, opened.sessionId, p.arquivos_pretendidos, p.areas, p.recuperar),
       ].join("\n"));
     },
   },
@@ -1576,6 +1612,11 @@ export const tools: ToolDef[] = [
         preferred_name: { type: "string", description: "Se preencher, tenta retomar agente com esse nome." },
         force_new: { type: "boolean", default: false, description: "Ignora match, cria agente novo." },
         retomar_agente_id: { type: "string", description: "ID de agente específico a retomar." },
+        recuperar: {
+          type: "boolean",
+          default: false,
+          description: "Padrão false: entra limpo, sem despejar o histórico anterior. true traz último progresso, tarefa em andamento, inbox e time.",
+        },
         tmux_pane: { type: "string", description: "Valor de $TMUX_PANE da pane atual (ex: %42). Passa explicitamente via Bash." },
       },
     },
@@ -1594,6 +1635,7 @@ export const tools: ToolDef[] = [
         preferred_name: z.string().optional(),
         force_new: z.boolean().optional().default(false),
         retomar_agente_id: z.string().optional(),
+        recuperar: z.boolean().optional().default(false),
         tmux_pane: z.string().optional(),
       });
       const p = schema.parse(args);
@@ -1747,12 +1789,14 @@ export const tools: ToolDef[] = [
       // last_heartbeat — heartbeat avança a cada tool call e esconderia mensagens
       // chegadas depois do último tool call mas antes de marcar_lido.
       const since = agent.last_seen_ms || agent.created_at;
-      const inbox = renderInbox(db, agent, since);
-      const ctx = renderTeamContext(db);
+      const inbox = p.recuperar ? renderInbox(db, agent, since) : "";
+      const ctx = p.recuperar ? renderTeamContext(db) : "";
 
-      // Restauração de contexto (só em modo resumed): progresso anterior + tarefa em andamento + últimos updates
+      // Restauração de contexto (só em modo resumed E sob pedido): progresso
+      // anterior + tarefa em andamento + últimos updates. Sem o pedido, a
+      // janela nova não herda histórico velho da pasta.
       const restoreLines: string[] = [];
-      if (mode === "resumed") {
+      if (mode === "resumed" && p.recuperar) {
         if (agent.progress_summary) {
           restoreLines.push("── ÚLTIMO PROGRESSO ──");
           restoreLines.push(agent.progress_summary);
@@ -1793,13 +1837,9 @@ export const tools: ToolDef[] = [
           `Papel: ${p.cargo}  Pasta: ${effectiveFolder || "—"}`,
           "auto_mode: ATIVO",
           "",
-          ...restoreLines,
-          "── INBOX ──",
-          inbox,
-          "",
-          "── TIME ──",
-          ctx,
-          "",
+          ...(p.recuperar
+            ? [...restoreLines, "── INBOX ──", inbox, "", "── TIME ──", ctx, ""]
+            : [renderResumoEntrada(db, agent.team_key, agent), ""]),
           "Guarde agent_id e session_id. Próximos comandos:",
           "  /status, /inbox, /falar, /pedir, /travar, /atualizar, /feito, /fechar",
         ].join("\n")

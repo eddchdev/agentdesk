@@ -239,7 +239,7 @@ Você normalmente usa linguagem natural; o cliente escolhe a tool correta.
 
 | Atalho/Tool | O que faz |
 |---|---|
-| `/abrir` → `abrir` | Cria ou retoma a identidade, elege gerente ou registra trabalhador e ativa auto. |
+| `/abrir` → `abrir` | Cria ou retoma a identidade, elege gerente ou registra trabalhador e ativa auto. Entra limpo: o histórico anterior da pasta só é carregado com `recuperar=true`. |
 | `listar_agentes` | Mostra identidade, autoridade, papel atual, carga e estado. |
 | `atribuir_papel` | Gerente define ou troca o papel livre de um agente. |
 | `listar_status` | Snapshot operacional da equipe, fila, chat e locks. |

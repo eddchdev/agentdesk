@@ -533,6 +533,30 @@ async function run() {
     await N.close();
   });
 
+  // ─── 17b. entrada limpa: histórico só vem com recuperar=true ──────
+  await test("abrir entra limpo e só traz histórico com recuperar=true", async () => {
+    const pasta = "/tmp/agentdesk-e2e-limpo";
+    const P1 = new Client("P1");
+    await P1.initialize();
+    const r1 = await P1.call("abrir", { pasta, preferred_name: "Velho" });
+    const s1 = extractValue(P1.text(r1), "session_id");
+    await P1.call("atualizar_progresso", { session_id: s1, progresso: "lixo-de-projeto-antigo" });
+    await P1.call("enviar_mensagem", { session_id: s1, mensagem: "mensagem-velha-da-equipe" });
+    await P1.call("pausar_agente", { session_id: s1 });
+    await P1.close();
+
+    const P2 = new Client("P2");
+    await P2.initialize();
+    const limpo = P2.text(await P2.call("abrir", { pasta, preferred_name: "Velho" }));
+    assert(!/mensagem-velha-da-equipe/.test(limpo), `entrada padrão despejou chat antigo:\n${limpo}`);
+    assert(!/ÚLTIMAS MENSAGENS|EQUIPE ATIVA/.test(limpo), `entrada padrão despejou contexto:\n${limpo}`);
+    assert(/recuperar=true/.test(limpo), `entrada padrão não ofereceu recuperação:\n${limpo}`);
+
+    const cheio = P2.text(await P2.call("abrir", { pasta, preferred_name: "Velho", recuperar: true }));
+    assert(/mensagem-velha-da-equipe/.test(cheio), `recuperar=true não trouxe o histórico:\n${cheio}`);
+    await P2.close();
+  });
+
   // ─── 18. heartbeat em sessão fechada falha ────────────────────────
   await test("heartbeat em sessão fechada falha", async () => {
     const O = new Client("O");
