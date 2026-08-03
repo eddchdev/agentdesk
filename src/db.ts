@@ -264,6 +264,11 @@ function migrate(db: Database.Database) {
   addColumnIfMissing(db, "chat_messages", "team_key", "TEXT NOT NULL DEFAULT 'default'");
   addColumnIfMissing(db, "handoffs", "team_key", "TEXT NOT NULL DEFAULT 'default'");
 
+  // v6: fechamento do ciclo. Onde o trabalho do item foi parar depois de
+  // aprovado (branch empurrada e, quando dá, o PR aberto).
+  addColumnIfMissing(db, "work_items", "integration_url", "TEXT");
+  addColumnIfMissing(db, "work_items", "integrated_at", "INTEGER");
+
   migrateAuthorityAndTeams(db);
 }
 

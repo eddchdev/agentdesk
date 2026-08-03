@@ -42,6 +42,123 @@ function git(cwd: string, args: string[]): string {
   });
 }
 
+export interface IntegracaoResult {
+  branch: string;
+  commit: string | null;
+  arquivos: string[];
+  enviada: boolean;
+  pr_url: string | null;
+  avisos: string[];
+}
+
+// Fecha o ciclo do item: commita o que está na worktree dele, empurra a branch
+// e abre o PR. Nunca faz merge: quem decide o que entra na branch principal é
+// a pessoa. O `add -A` é seguro aqui porque a worktree foi criada pelo
+// AgentDesk para este item e nada mais escreve nela.
+export function integrarWorktree(input: {
+  worktreePath: string;
+  branch: string;
+  titulo: string;
+  corpo: string;
+  enviar: boolean;
+  abrirPr: boolean;
+  timeoutMs?: number;
+}): IntegracaoResult {
+  const avisos: string[] = [];
+  const cwd = input.worktreePath;
+  if (!existsSync(cwd)) throw new Error(`A worktree ${cwd} não existe mais; não há o que integrar.`);
+  const timeout = input.timeoutMs ?? 120_000;
+  const rodar = (cmd: string, args: string[], dir = cwd) =>
+    execFileSync(cmd, args, { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout });
+
+  const pendentes = rodar("git", ["status", "--porcelain"]).trim();
+  const arquivos = pendentes
+    ? pendentes.split("\n").map((linha) => linha.slice(3).trim()).filter(Boolean)
+    : [];
+
+  let commit: string | null = null;
+  if (arquivos.length) {
+    rodar("git", ["add", "-A"]);
+    try {
+      rodar("git", ["commit", "-m", input.titulo, "-m", input.corpo]);
+      commit = rodar("git", ["rev-parse", "--short", "HEAD"]).trim();
+    } catch (error: any) {
+      const saida = [error?.stdout, error?.stderr].filter(Boolean).join("\n");
+      if (/user\.email|user\.name|Please tell me who you are/i.test(saida)) {
+        throw new Error("git sem autor configurado nesta máquina (git config user.name / user.email).");
+      }
+      throw new Error(`git commit falhou: ${saida.trim() || error?.message}`);
+    }
+  } else {
+    // Sem mudança pendente ainda pode haver commit local esperando push.
+    avisos.push("nada novo para commitar na worktree");
+  }
+
+  const temRemote = rodar("git", ["remote"]).trim().length > 0;
+  if (!temRemote) {
+    avisos.push("repositório sem remote: nada foi enviado, o trabalho está na branch local");
+    return { branch: input.branch, commit, arquivos, enviada: false, pr_url: null, avisos };
+  }
+
+  let enviada = false;
+  if (input.enviar) {
+    try {
+      rodar("git", ["push", "-u", "origin", input.branch]);
+      enviada = true;
+    } catch (error: any) {
+      const saida = [error?.stdout, error?.stderr].filter(Boolean).join("\n");
+      avisos.push(`push falhou: ${saida.trim().split("\n").slice(-2).join(" ") || error?.message}`);
+      return { branch: input.branch, commit, arquivos, enviada: false, pr_url: null, avisos };
+    }
+  }
+
+  let prUrl: string | null = null;
+  if (input.abrirPr && enviada) {
+    const base = baseDoRepo(cwd, rodar);
+    try {
+      const saida = rodar("gh", [
+        "pr", "create",
+        "--base", base,
+        "--head", input.branch,
+        "--title", input.titulo,
+        "--body", input.corpo,
+      ]);
+      prUrl = saida.trim().split("\n").find((linha) => linha.startsWith("http")) ?? null;
+    } catch (error: any) {
+      const saida = [error?.stdout, error?.stderr].filter(Boolean).join("\n");
+      if (/already exists/i.test(saida)) {
+        prUrl = saida.match(/https?:\/\/\S+/)?.[0] ?? null;
+        avisos.push("PR já existia para esta branch");
+      } else if (error?.code === "ENOENT") {
+        avisos.push(`gh não instalado: abra o PR manualmente a partir da branch ${input.branch}`);
+      } else {
+        avisos.push(`gh pr create falhou: ${saida.trim().split("\n").slice(-2).join(" ") || error?.message}`);
+      }
+    }
+  }
+
+  return { branch: input.branch, commit, arquivos, enviada, pr_url: prUrl, avisos };
+}
+
+function baseDoRepo(cwd: string, rodar: (cmd: string, args: string[], dir?: string) => string): string {
+  try {
+    const ref = rodar("git", ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).trim();
+    const nome = ref.split("/").pop();
+    if (nome) return nome;
+  } catch {
+    /* sem origin/HEAD local */
+  }
+  for (const candidata of ["main", "master"]) {
+    try {
+      rodar("git", ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidata}`]);
+      return candidata;
+    } catch {
+      /* tenta a próxima */
+    }
+  }
+  return "main";
+}
+
 // Cleanup de worktrees abandonadas. Remove diretórios em /tmp/agentdesk-worktrees
 // que não foram tocados há mais de TTL_MS. Conservador: usa stat.mtimeMs do dir
 // inteiro (qualquer escrita dentro do worktree atualiza). Worktrees ativas

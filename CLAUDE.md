@@ -31,6 +31,7 @@ Quando o usuário fornecer uma lista ou objetivo composto:
 4. Use `estrategia=balanceada` por padrão; `especialidade` quando papéis existentes importarem; `fila` quando agentes ainda não estiverem abertos.
 5. Não microgerencie decisões locais. Monitore somente bloqueios, integração e prioridade.
 6. Revisões são assíncronas e podem ser feitas por qualquer par da equipe que não seja o autor.
+7. Item aprovado é fechado com `integrar_tarefa`: commita a worktree, empurra a branch e abre o PR. O merge fica com a pessoa; nunca junte nada sozinho.
 
 Dependências dentro do lote usam a `chave` do item. IDs existentes também são aceitos. Para uma nota que não bloqueia, prefixe com `nota:`.
 
@@ -92,6 +93,7 @@ Ao escalar, envie uma mensagem curta com evidência, impacto e recomendação. E
 | Entregar e puxar próximo | `entregar_tarefa` |
 | Bloquear e puxar próximo | `bloquear_tarefa` |
 | Revisão por par | `revisar_tarefa` |
+| Fechar o ciclo (branch, PR) | `integrar_tarefa` |
 | Mensagem direcionada | `pedir_acao` |
 | Fechar corretamente | `fechar_sessao` ou `pausar_agente` |
 | Medir a produção do período | `relatorio_equipe` |
