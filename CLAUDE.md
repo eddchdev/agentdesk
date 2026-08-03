@@ -97,5 +97,7 @@ Ao escalar, envie uma mensagem curta com evidência, impacto e recomendação. E
 | Mensagem direcionada | `pedir_acao` |
 | Fechar corretamente | `fechar_sessao` ou `pausar_agente` |
 | Medir a produção do período | `relatorio_equipe` |
+| Ver o que espera decisão da pessoa | `painel` |
+| Choque real entre branches | `conflitos_entre_branches` |
 
 As tools `abrir_ou_retornar_agente`, `abrir_sessao` e `delegar_tarefa` continuam disponíveis para clientes antigos. Novos fluxos devem usar `abrir` e `distribuir_tarefas`.
