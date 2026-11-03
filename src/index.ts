@@ -56,8 +56,13 @@ async function main() {
   }, 30_000);
   sweepInterval.unref?.();
 
-  // GC: limpa events/chat/sessions antigas a cada 1h. Idempotente — vários
+  // GC: limpa events/chat/tarefas/sessions antigas ao subir e a cada 1h. Idempotente — vários
   // MCP servers podem rodar GC simultâneo sem conflito (tx.immediate serializa).
+  try {
+    gcOldData(getDb());
+  } catch {
+    /* ignore */
+  }
   const gcInterval = setInterval(() => {
     try {
       gcOldData(getDb());
