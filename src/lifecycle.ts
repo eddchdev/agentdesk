@@ -225,19 +225,29 @@ export function requireActiveSession(db: Database.Database, sessionId: string): 
   return row;
 }
 
-// GC de dados antigos. Chamado periodicamente (sweep ou broker).
+// GC de dados antigos. Roda ao subir o MCP e depois a cada 1h.
 // - events: > 7 dias (audit log barato de regenerar)
-// - chat_messages: > 30 dias (mantém histórico mais longo)
+// - chat_messages: > 3 dias (AGENTDESK_RETER_CHAT_DIAS). Chat é coordenação do
+//   momento; histórico longo só polui o painel e o inbox de quem chega.
+// - work_items: concluído/cancelado ou abandonado (fila/bloqueado sem mexer)
+//   há mais de 7 dias sai do banco (AGENTDESK_RETER_TAREFAS_DIAS). Item em
+//   andamento ou em revisão nunca é apagado.
 // - sessions closed: > 60 dias (já tem agente persistente, sessão é histórico)
-// Conservador: nunca apaga agentes nem work_items.
-const GC_EVENTS_MS = 7 * 24 * 60 * 60 * 1000;
-const GC_CHAT_MS = 30 * 24 * 60 * 60 * 1000;
-const GC_SESSIONS_MS = 60 * 24 * 60 * 60 * 1000;
-// Agente morto sem nenhuma notícia por 7 dias sai das listagens padrão.
+// - agentes sem sinal há 7 dias são arquivados (não apagados).
+const DIA_MS = 24 * 60 * 60 * 1000;
+const dias = (env: string | undefined, padrao: number) => {
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : padrao;
+};
+const GC_EVENTS_MS = 7 * DIA_MS;
+const GC_CHAT_MS = dias(process.env.AGENTDESK_RETER_CHAT_DIAS, 3) * DIA_MS;
+const GC_WORK_ITEMS_MS = dias(process.env.AGENTDESK_RETER_TAREFAS_DIAS, 7) * DIA_MS;
+const GC_SESSIONS_MS = 60 * DIA_MS;
+// Agente sem nenhuma notícia por 7 dias sai das listagens padrão.
 // Arquivar não apaga: listar_agentes com incluir_arquivados mostra tudo.
-const GC_DEAD_AGENT_MS = 7 * 24 * 60 * 60 * 1000;
+const GC_DEAD_AGENT_MS = 7 * DIA_MS;
 
-export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number; agents: number; work_items: number } {
+export function gcOldData(db: Database.Database): { events: number; chat: number; sessions: number; tasks: number; agents: number; work_items: number; work_items_apagados: number } {
   const ts = now();
   const tx = db.transaction(() => {
     const e = db.prepare("DELETE FROM events WHERE created_at < ?").run(ts - GC_EVENTS_MS).changes;
@@ -248,10 +258,14 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
     // Arquiva (não apaga) agente morto há mais de 7 dias. Ele sai do painel
     // padrão mas segue no histórico; um gerente morto arquivado também libera
     // a vaga de eleição da equipe (o índice único ignora arquivados).
+    // Também arquiva quem ficou "disponível" sem dar sinal (janela fechada sem /fechar).
     const a = db.prepare(
       `UPDATE agents SET status = 'archived', updated_at = ?
-       WHERE status = 'dead' AND updated_at < ?`
-    ).run(ts, ts - GC_DEAD_AGENT_MS).changes;
+       WHERE status != 'archived' AND (
+         (status = 'dead' AND updated_at < ?)
+         OR MAX(updated_at, last_seen_ms, last_heartbeat) < ?
+       )`
+    ).run(ts, ts - GC_DEAD_AGENT_MS, ts - GC_DEAD_AGENT_MS).changes;
     // Cura zumbis deixados por versões antigas: task 'in_progress' cuja
     // sessão já fechou (ou nem existe mais) volta para 'pending'.
     const t = db.prepare(
@@ -275,7 +289,15 @@ export function gcOldData(db: Database.Database): { events: number; chat: number
             OR owner_session_id NOT IN (SELECT id FROM sessions)
           )`
     ).run(ts).changes;
-    return { events: e, chat: c, sessions: s, tasks: t, agents: a, work_items: w };
+    // Tarefa velha sai do banco: concluída/cancelada, ou parada na fila/bloqueada
+    // sem ninguém mexer. Roda depois do requeue acima, então um item que acabou
+    // de voltar para a fila tem updated_at novo e não é apagado agora.
+    const wd = db.prepare(
+      `DELETE FROM work_items
+        WHERE status IN ('done', 'canceled', 'queued', 'blocked')
+          AND updated_at < ?`
+    ).run(ts - GC_WORK_ITEMS_MS).changes;
+    return { events: e, chat: c, sessions: s, tasks: t, agents: a, work_items: w, work_items_apagados: wd };
   });
   return tx.immediate() as any;
 }
